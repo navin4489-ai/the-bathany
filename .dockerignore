@@ -1,0 +1,11 @@
+# Keep the build context small and avoid copying host build output into the image.
+**/node_modules
+**/dist
+**/bin
+**/obj
+**/publish
+apps/tools
+apps/api/Eshopper.Api/wwwroot
+.git
+.vs
+*.log

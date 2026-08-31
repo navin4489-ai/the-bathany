@@ -1,0 +1,10 @@
+USE Eshopper;
+INSERT Roles(Name) SELECT 'Customer' WHERE NOT EXISTS (SELECT 1 FROM Roles WHERE Name='Customer');
+INSERT Roles(Name) SELECT 'Admin' WHERE NOT EXISTS (SELECT 1 FROM Roles WHERE Name='Admin');
+INSERT Categories(Name) SELECT 'Bath Rituals' WHERE NOT EXISTS (SELECT 1 FROM Categories WHERE Name='Bath Rituals');
+INSERT Categories(Name) SELECT 'Whipped Soaps' WHERE NOT EXISTS (SELECT 1 FROM Categories WHERE Name='Whipped Soaps');
+INSERT Users(Email,DisplayName,PasswordHash,Role) SELECT 'admin@eshopper.local','Store Admin','pbkdf2-sha256$120000$AAAAAAAAAAAAAAAAAAAAAA==$kX0KA5ypCZRdRwh7WSQbRvTskwDcvaj+dluN4LtUvzo=','Admin' WHERE NOT EXISTS (SELECT 1 FROM Users WHERE Email='admin@eshopper.local');
+INSERT Products(Name,Description,Price,Stock,ImageUrl,CategoryId) SELECT 'Potion No. 04','Botanical bath ritual whipped with rose petals and moonlit florals. Sealed with a charm and a velvet ribbon.',1299.00,100,'assets/brand/product-1.jpeg',Id FROM Categories WHERE Name='Bath Rituals' AND NOT EXISTS (SELECT 1 FROM Products WHERE Name='Potion No. 04');
+INSERT Products(Name,Description,Price,Stock,ImageUrl,CategoryId) SELECT 'Chai Spice Soul Whipped Soap','Warm cardamom, clove and vanilla whipped into a cloud-soft soap, wrapped in a hand block-printed pouch.',1499.00,50,'assets/brand/product-2.jpeg',Id FROM Categories WHERE Name='Whipped Soaps' AND NOT EXISTS (SELECT 1 FROM Products WHERE Name='Chai Spice Soul Whipped Soap');
+INSERT Products(Name,Description,Price,Stock,ImageUrl,CategoryId) SELECT 'Raspberry Swirl Bath Cloud','Pure and whimsical whipped bath cloud, served with a little wooden spoon. Scoop, swirl and soak.',1699.00,30,'assets/brand/product-3.jpeg',Id FROM Categories WHERE Name='Bath Rituals' AND NOT EXISTS (SELECT 1 FROM Products WHERE Name='Raspberry Swirl Bath Cloud');
+INSERT Products(Name,Description,Price,Stock,ImageUrl,CategoryId) SELECT 'Whipped Soap Boba','Rose and coconut whipped soap topped with gently exfoliating boba pearls. 250ml of pure indulgence.',899.00,40,'assets/brand/product-4.jpeg',Id FROM Categories WHERE Name='Whipped Soaps' AND NOT EXISTS (SELECT 1 FROM Products WHERE Name='Whipped Soap Boba');

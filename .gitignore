@@ -1,0 +1,27 @@
+# Tooling
+apps/tools/cloudflared.exe
+apps/tools/tunnel.log
+
+# Node
+node_modules/
+apps/web/.angular/
+
+# Build output
+dist/
+bin/
+obj/
+publish/
+
+# Built SPA is produced by the Docker build, not committed
+apps/api/Eshopper.Api/wwwroot/
+
+# Local uploads
+apps/api/Eshopper.Api/wwwroot/uploads/
+
+# Editor / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store
+*.log

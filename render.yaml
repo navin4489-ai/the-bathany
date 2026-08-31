@@ -1,0 +1,24 @@
+# Render blueprint: builds the Dockerfile at the repo root, which compiles the Angular
+# SPA and the .NET API into a single container serving both from one origin.
+services:
+  - type: web
+    name: the-bathany
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production
+      # Persist data by pointing this at a real SQL Server and removing Database__Provider.
+      - key: Database__Provider
+        value: InMemory
+      - key: Auth__ExposeResetToken
+        value: "false"
+      - key: Jwt__Issuer
+        value: TheBathany.Api
+      - key: Jwt__Audience
+        value: TheBathany.Web
+      # Render generates a strong random value and keeps it out of source control.
+      - key: Jwt__SigningKey
+        generateValue: true
