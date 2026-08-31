@@ -1,26 +1,53 @@
 # The Bathany — Deployment Guide
 
-## 1. Live test URL
+## 1. Live URL (permanent — Render)
 
-The application is published on a free Cloudflare Quick Tunnel. Both the Angular storefront
-and the .NET API are served from a **single origin**, so there is only one URL to share.
+The application is deployed on **Render's free tier** from the GitHub repository
+[navin4489-ai/the-bathany](https://github.com/navin4489-ai/the-bathany). A single Docker
+container builds the Angular SPA and the .NET 9 API and serves both from **one origin**,
+so there is only one URL to share.
+
+**Live site: https://the-bathany.onrender.com**
 
 | What | URL |
 | --- | --- |
-| Storefront (home) | https://imperial-listen-explanation-parts.trycloudflare.com |
-| Shop / collection | https://imperial-listen-explanation-parts.trycloudflare.com/shop |
-| Our Rituals | https://imperial-listen-explanation-parts.trycloudflare.com/rituals |
-| Ingredients | https://imperial-listen-explanation-parts.trycloudflare.com/ingredients |
-| Care | https://imperial-listen-explanation-parts.trycloudflare.com/care |
-| My orders | https://imperial-listen-explanation-parts.trycloudflare.com/orders |
-| Admin console | https://imperial-listen-explanation-parts.trycloudflare.com/admin |
-| API root | https://imperial-listen-explanation-parts.trycloudflare.com/api/catalog/products |
-| Health probe | https://imperial-listen-explanation-parts.trycloudflare.com/health |
-| Swagger (dev only) | https://imperial-listen-explanation-parts.trycloudflare.com/swagger |
+| Storefront (home) | https://the-bathany.onrender.com |
+| Shop / collection | https://the-bathany.onrender.com/shop |
+| Wishlist | https://the-bathany.onrender.com/wishlist |
+| Our Rituals | https://the-bathany.onrender.com/rituals |
+| Ingredients | https://the-bathany.onrender.com/ingredients |
+| Care | https://the-bathany.onrender.com/care |
+| My orders | https://the-bathany.onrender.com/orders |
+| Admin console | https://the-bathany.onrender.com/admin |
+| API (products) | https://the-bathany.onrender.com/api/catalog/products |
+| Health probe | https://the-bathany.onrender.com/health |
 
-> **This URL is temporary.** A Quick Tunnel URL lives only as long as the `cloudflared`
-> process and the local API keep running, and a **new random URL is issued every restart**.
-> It is intended for testing and demos, not for production. See §6 for permanent hosting.
+Management dashboard: <https://dashboard.render.com/web/srv-daajsg1srm7s73f5imd0>
+(service `the-bathany`, blueprint `the-bathany`, workspace "Navin's workspace").
+
+Deployment is **automatic**: pushing to `main` on GitHub triggers a rebuild and redeploy.
+
+### Free-tier characteristics
+
+1. **Cold starts.** The instance spins down after ~15 minutes of inactivity. The next
+   request can take **50 seconds or more** while it wakes. This is normal, not a fault.
+2. **Data is not persistent.** The service runs with `Database__Provider=InMemory`, so
+   **all users, orders and uploaded images are lost on every restart**, including after a
+   spin-down. Attach a real database to fix this — see
+   [PRODUCTION-REQUIREMENTS.md](./PRODUCTION-REQUIREMENTS.md) §1.5.
+3. **Shared resources.** 512 MB RAM and shared CPU, so responses are slower than local.
+
+### Previous test URL (retired)
+
+An earlier deployment used a Cloudflare Quick Tunnel. That approach issued a **new random
+URL on every restart** and required a local process to stay running, so it has been
+replaced by the Render deployment above.
+
+> **Why not Cloudflare?** Cloudflare Pages and Workers run static assets and JavaScript on
+> V8 — they **cannot execute an ASP.NET Core process or SQL Server**. Cloudflare Containers
+> can, but the dashboard requires the paid **Workers Paid** plan, and a Named Tunnel needs a
+> registered domain. Render was chosen because it runs the .NET API and the SPA together at
+> no cost.
 
 ## 2. Test credentials
 
@@ -161,3 +188,33 @@ Checked at 320, 360, 390, 414, 768, 1024 and 1440px wide:
 - All checkout inputs render at 16px, so iOS Safari does not zoom in when a field is focused.
 - A complete purchase was made at 390px wide: order #5, `Approved`, ₹1,299, with the
   confirmation modal fitting inside the viewport.
+
+## 10. Live verification on Render (31 Aug 2026)
+
+Every check below was run against **https://the-bathany.onrender.com** over the public
+internet after the first successful deploy (commit `e43d4a7`, build 1m32s).
+
+| Check | Result |
+| --- | --- |
+| `/health` | 200 |
+| SPA routes `/`, `/shop`, `/wishlist`, `/rituals`, `/admin` | all 200 |
+| `GET /api/catalog/products` | 4 products, INR pricing |
+| DB-backed images `/api/catalog/images/1..4` | all 200, `image/jpeg`, 81–113 KB |
+| Static assets `/assets/brand/*` | all 200 (9/9 requests in browser network log) |
+| Register + login | 200, `accessToken` issued |
+| **Card checkout** (`4242…4242`, qty 2) | **order #1 `Paid` ₹3,398, Visa \*\*\*\*4242** |
+| Shipping address stored | Mumbai, Maharashtra 400020 |
+| **Declined card** (`4000…0002`) | order #2 `PaymentFailed`, "Card declined by issuer." |
+| Admin login | role `Admin` |
+| `GET /api/admin/config` | currency `INR ₹` |
+| `GET /api/admin/orders` | admin sees the order |
+| **Swagger disabled in Production** | `/swagger/v1/swagger.json` → **404** |
+| **Reset-token leak check** | `forgot-password` returns only `message` — **no token** |
+
+Both production hardening flags were confirmed **in the live environment**, not just in
+configuration: Swagger is off and `Auth__ExposeResetToken=false` is effective.
+
+> **Note on intermittent image warnings.** During testing, browser snapshots occasionally
+> reported a product image as not yet decoded. Capturing the actual network responses showed
+> **HTTP 200 for every asset request**; the readings were the page snapshot racing image
+> decode on a slow free-tier connection, not a missing file.
