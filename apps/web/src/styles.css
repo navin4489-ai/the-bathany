@@ -466,3 +466,15 @@ img, video { max-width: 100%; }
 .detail-actions { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
 .wish-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
 a.wishlist { color: var(--primary-dark); }
+
+/* Shared table pager */
+.pager { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin: -18px 0 30px; padding: 10px 14px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+.pager-controls { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.pager-controls .btn-sm { min-width: 34px; padding: 6px 10px; }
+.pager-controls .btn-sm.active { background: #2b2b2b; color: #fff; border-color: #2b2b2b; }
+.pager-controls .btn-sm:disabled { opacity: .4; cursor: default; }
+.pager-gap { padding: 0 4px; color: #999; }
+.pager-size select { margin-left: 6px; padding: 5px 8px; border: 1px solid #ddd; border-radius: 4px; font: inherit; }
+.table-filters { margin-top: 12px; }
+.ip { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+@media (max-width: 640px) { .pager { justify-content: center; } }

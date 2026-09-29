@@ -11,6 +11,7 @@ public record AdminResetPasswordRequest(string NewPassword);
 public record ProductRequest(string? Name = null, string? Description = null, decimal Price = 0, int Stock = 0, string? ImageUrl = null, int CategoryId = 1, bool IsActive = true);
 public record OrderStatusRequest(string? Status = null);
 public record UserRoleRequest(string? Role = null);
+public record PageResult(object Items, int Total, int Page, int PageSize, int Pages);
 
 [ApiController, Route("api/admin")]
 [Authorize(Policy = "AdminOnly")]
@@ -23,6 +24,17 @@ public class AdminController(ShopDbContext db, IPasswordService passwords, IEmai
         db.AuditActivities.Add(new AuditActivity { Action = action, Details = details, UserId = CurrentUserId() });
 
     private int? CurrentUserId() => int.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out var id) ? id : null;
+
+    /// <summary>Uniform page envelope so every admin table paginates the same way.</summary>
+    private static async Task<PageResult> Page<T>(IQueryable<T> query, int page, int pageSize, Func<List<T>, object>? project = null)
+    {
+        pageSize = Math.Clamp(pageSize, 5, 100);
+        var total = await query.CountAsync();
+        var pages = Math.Max(1, (int)Math.Ceiling(total / (double)pageSize));
+        page = Math.Clamp(page, 1, pages);
+        var rows = await query.Skip((page - 1) * pageSize).Take(pageSize).ToListAsync();
+        return new PageResult(project is null ? rows : project(rows), total, page, pageSize, pages);
+    }
 
     /// <summary>Drives the admin UI: which sections exist, their columns and the allowed option lists.</summary>
     [HttpGet("config")]
@@ -108,8 +120,13 @@ public class AdminController(ShopDbContext db, IPasswordService passwords, IEmai
     }
 
     [HttpGet("products")]
-    public Task<List<object>> Products() => db.Products.AsNoTracking().OrderBy(p => p.Id)
-        .Select(p => (object)new { p.Id, p.Name, p.Description, p.Price, p.Stock, p.ImageUrl, p.CategoryId, p.IsActive }).ToListAsync();
+    public async Task<IActionResult> Products([FromQuery] int page = 1, [FromQuery] int pageSize = 10, [FromQuery] string? search = null)
+    {
+        var query = db.Products.AsNoTracking();
+        if (!string.IsNullOrWhiteSpace(search)) { var t = search.Trim(); query = query.Where(p => p.Name.Contains(t) || p.Description.Contains(t) || p.Id.ToString() == t); }
+        return Ok(await Page(query.OrderBy(p => p.Id)
+            .Select(p => new { p.Id, p.Name, p.Description, p.Price, p.Stock, p.ImageUrl, p.CategoryId, p.IsActive }), page, pageSize));
+    }
 
     [HttpPost("products")]
     public async Task<IActionResult> Add(ProductRequest input)
@@ -170,12 +187,18 @@ public class AdminController(ShopDbContext db, IPasswordService passwords, IEmai
     }
 
     [HttpGet("orders")]
-    public async Task<IActionResult> Orders()
+    public async Task<IActionResult> Orders([FromQuery] int page = 1, [FromQuery] int pageSize = 10, [FromQuery] string? search = null, [FromQuery] string? status = null)
     {
-        var orders = await db.Orders.AsNoTracking().Include(o => o.Items).Include(o => o.Payment).Include(o => o.ShippingAddress)
-            .OrderByDescending(o => o.CreatedAt).ToListAsync();
+        var query = db.Orders.AsNoTracking().Include(o => o.Items).Include(o => o.Payment).Include(o => o.ShippingAddress).AsSplitQuery();
+        if (!string.IsNullOrWhiteSpace(status)) query = query.Where(o => o.Status == status);
+        if (!string.IsNullOrWhiteSpace(search))
+        {
+            var t = search.Trim().TrimStart('#');
+            var userIds = db.Users.Where(u => u.Email.Contains(t) || u.DisplayName.Contains(t)).Select(u => u.Id);
+            query = query.Where(o => o.Id.ToString() == t || userIds.Contains(o.UserId) || (o.ShippingAddress != null && (o.ShippingAddress.FullName.Contains(t) || o.ShippingAddress.Phone.Contains(t))));
+        }
         var emails = await db.Users.AsNoTracking().ToDictionaryAsync(u => u.Id, u => u.Email);
-        return Ok(orders.Select(o => new
+        return Ok(await Page(query.OrderByDescending(o => o.CreatedAt), page, pageSize, orders => orders.Select(o => new
         {
             o.Id, o.UserId,
             customer = emails.TryGetValue(o.UserId, out var email) ? email : "unknown",
@@ -187,7 +210,7 @@ public class AdminController(ShopDbContext db, IPasswordService passwords, IEmai
                 o.ShippingAddress.FullName, o.ShippingAddress.Phone, o.ShippingAddress.Line1, o.ShippingAddress.Line2,
                 o.ShippingAddress.City, o.ShippingAddress.State, o.ShippingAddress.PostalCode, o.ShippingAddress.Country, o.ShippingAddress.Landmark
             }
-        }));
+        }).ToList()));
     }
 
     [HttpPut("orders/{id:int}/status")]
@@ -214,7 +237,7 @@ public class AdminController(ShopDbContext db, IPasswordService passwords, IEmai
     /// status, provider and a free-text search across reference, customer and order number.
     /// </summary>
     [HttpGet("payments")]
-    public async Task<IActionResult> Payments([FromQuery] string? status = null, [FromQuery] string? provider = null, [FromQuery] string? search = null)
+    public async Task<IActionResult> Payments([FromQuery] string? status = null, [FromQuery] string? provider = null, [FromQuery] string? search = null, [FromQuery] int page = 1, [FromQuery] int pageSize = 10)
     {
         var query = from p in db.Payments.AsNoTracking()
                     join o in db.Orders.AsNoTracking() on p.OrderId equals o.Id
@@ -244,28 +267,43 @@ public class AdminController(ShopDbContext db, IPasswordService passwords, IEmai
                 x.OrderId.ToString() == term);
         }
 
-        var rows = await query.OrderByDescending(x => x.ProcessedAt).Take(500).ToListAsync();
-        // Only money that actually settled counts as captured revenue.
-        var captured = rows.Where(r => r.Status is "Approved" or "Captured").ToList();
+        // Summary covers every matching payment, not just the visible page.
+        var totals = await query.Select(r => new { r.Status, r.Amount, r.RefundedAmount, r.Provider }).ToListAsync();
+        var captured = totals.Where(r => r.Status is "Approved" or "Captured").ToList();
+        var paged = await Page(query.OrderByDescending(x => x.ProcessedAt), page, pageSize);
         return Ok(new
         {
             summary = new
             {
-                count = rows.Count,
+                count = totals.Count,
                 captured = captured.Count,
-                failed = rows.Count(r => r.Status is "Declined" or "Failed"),
-                pending = rows.Count(r => r.Status is "Pending" or "Authorized"),
+                failed = totals.Count(r => r.Status is "Declined" or "Failed"),
+                pending = totals.Count(r => r.Status is "Pending" or "Authorized"),
                 capturedAmount = captured.Sum(r => r.Amount),
-                refundedAmount = rows.Sum(r => r.RefundedAmount),
-                online = rows.Count(r => r.Provider == "razorpay")
+                refundedAmount = totals.Sum(r => r.RefundedAmount),
+                online = totals.Count(r => r.Provider == "razorpay")
             },
             providers = await db.Payments.AsNoTracking().Select(p => p.Provider).Distinct().ToListAsync(),
             statuses = await db.Payments.AsNoTracking().Select(p => p.Status).Distinct().ToListAsync(),
-            items = rows
+            items = paged.Items, total = paged.Total, page = paged.Page, pageSize = paged.PageSize, pages = paged.Pages
         });
     }
 
-    [HttpGet("users")] public Task<List<object>> Users() => db.Users.AsNoTracking().OrderBy(u => u.Id)        .Select(u => (object)new { u.Id, u.Email, u.DisplayName, u.Role, u.CreatedAt }).ToListAsync();
+    [HttpGet("users")]
+    public async Task<IActionResult> Users([FromQuery] int page = 1, [FromQuery] int pageSize = 10, [FromQuery] string? search = null, [FromQuery] string? role = null)
+    {
+        var query = db.Users.AsNoTracking();
+        if (!string.IsNullOrWhiteSpace(role)) query = query.Where(u => u.Role == role);
+        if (!string.IsNullOrWhiteSpace(search)) { var t = search.Trim(); query = query.Where(u => u.Email.Contains(t) || u.DisplayName.Contains(t)); }
+        var rows = query.OrderBy(u => u.Id).Select(u => new
+        {
+            u.Id, u.Email, u.DisplayName, u.Role, u.CreatedAt,
+            lastLogin = db.AuditActivities.Where(a => a.UserId == u.Id && a.Action == "Login").OrderByDescending(a => a.CreatedAt)
+                .Select(a => new { a.CreatedAt, a.IpAddress }).FirstOrDefault(),
+            orders = db.Orders.Count(o => o.UserId == u.Id)
+        });
+        return Ok(await Page(rows, page, pageSize));
+    }
 
     [HttpPut("users/{id:int}/role")]
     public async Task<IActionResult> UpdateRole(int id, UserRoleRequest request)
@@ -302,7 +340,27 @@ public class AdminController(ShopDbContext db, IPasswordService passwords, IEmai
     }
 
     [HttpGet("activity")]
-    public Task<List<AuditActivity>> Activity() => db.AuditActivities.AsNoTracking().OrderByDescending(a => a.CreatedAt).Take(200).ToListAsync();
+    public async Task<IActionResult> Activity([FromQuery] int page = 1, [FromQuery] int pageSize = 20, [FromQuery] string? action = null,
+        [FromQuery] string? search = null, [FromQuery] int? userId = null)
+    {
+        var query = from a in db.AuditActivities.AsNoTracking()
+                    join u in db.Users.AsNoTracking() on a.UserId equals u.Id into gu
+                    from u in gu.DefaultIfEmpty()
+                    select new { a.Id, a.UserId, a.Action, a.Details, a.IpAddress, a.UserAgent, a.CreatedAt, userEmail = u != null ? u.Email : null, userName = u != null ? u.DisplayName : null };
+        if (!string.IsNullOrWhiteSpace(action)) query = query.Where(a => a.Action == action);
+        if (userId is not null) query = query.Where(a => a.UserId == userId);
+        if (!string.IsNullOrWhiteSpace(search))
+        {
+            var t = search.Trim();
+            query = query.Where(a => a.Details.Contains(t) || a.IpAddress.Contains(t) || (a.userEmail != null && a.userEmail.Contains(t)));
+        }
+        var result = await Page(query.OrderByDescending(a => a.Id), page, pageSize);
+        return Ok(new
+        {
+            items = result.Items, total = result.Total, page = result.Page, pageSize = result.PageSize, pages = result.Pages,
+            actions = await db.AuditActivities.AsNoTracking().Select(a => a.Action).Distinct().OrderBy(a => a).ToListAsync()
+        });
+    }
 
     /// <summary>
     /// Poll for activity newer than <paramref name="afterId"/> so the admin console can alert on

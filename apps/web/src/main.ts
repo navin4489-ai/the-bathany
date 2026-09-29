@@ -1,7 +1,7 @@
 import { bootstrapApplication } from '@angular/platform-browser';
 import { provideHttpClient } from '@angular/common/http';
 import { ActivatedRoute, provideRouter, Router, RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
-import { Component, Injectable, LOCALE_ID, DEFAULT_CURRENCY_CODE, OnDestroy, NgZone, isDevMode } from '@angular/core';
+import { Component, Injectable, LOCALE_ID, DEFAULT_CURRENCY_CODE, OnDestroy, NgZone, isDevMode, Input, Output, EventEmitter } from '@angular/core';
 import { CommonModule, CurrencyPipe, DatePipe, UpperCasePipe, registerLocaleData } from '@angular/common';
 import localeIn from '@angular/common/locales/en-IN';
 import { FormsModule } from '@angular/forms';
@@ -77,6 +77,11 @@ export class Api {
     return this.http.post<{ url: string }>(`${this.base}/admin/uploads/product-image`, data, { headers: this.authHeaders() });
   }
   login(body: unknown) { return this.http.post<{ accessToken: string }>(`${this.base}/auth/login`, body); }
+  logout() { return this.http.post(`${this.base}/auth/logout`, {}, { headers: this.authHeaders() }).pipe(catchError(() => of(null))); }
+  /** Fire-and-forget: tracking must never block or break the shopper's action. */
+  track(action: string, productId: number, quantity?: number) {
+    this.http.post(`${this.base}/activity`, { action, productId, quantity }, { headers: this.authHeaders() }).pipe(catchError(() => of(null))).subscribe();
+  }
   register(body: unknown) { return this.http.post<{ id: number; email: string }>(`${this.base}/auth/register`, body); }
   forgotPassword(body: unknown) { return this.http.post<any>(`${this.base}/auth/forgot-password`, body); }
   resetPassword(body: unknown) { return this.http.post<any>(`${this.base}/auth/reset-password`, body); }
@@ -109,6 +114,56 @@ export class Auth {
   setToken(token: string) { localStorage.setItem('token', token); }
   logout() { localStorage.removeItem('token'); }
 }
+
+/**
+ * Shared pager for every table. Works for server-paged data (bind total/page from the API envelope)
+ * and client-side lists (bind the array length). Emits page and page-size changes; the owner fetches.
+ */
+@Component({
+  selector: 'app-pager', standalone: true, imports: [CommonModule, FormsModule],
+  template: `<div class="pager" *ngIf="total > 0">
+    <span class="muted">{{ from }}–{{ to }} of {{ total }}</span>
+    <div class="pager-controls">
+      <button class="btn-light btn-sm" [disabled]="page <= 1" (click)="go(1)" aria-label="First page">«</button>
+      <button class="btn-light btn-sm" [disabled]="page <= 1" (click)="go(page - 1)" aria-label="Previous page">‹</button>
+      <ng-container *ngFor="let p of pagesToShow">
+        <span *ngIf="p === 0" class="pager-gap">…</span>
+        <button *ngIf="p !== 0" class="btn-light btn-sm" [class.active]="p === page" (click)="go(p)" [attr.aria-current]="p === page ? 'page' : null">{{ p }}</button>
+      </ng-container>
+      <button class="btn-light btn-sm" [disabled]="page >= pages" (click)="go(page + 1)" aria-label="Next page">›</button>
+      <button class="btn-light btn-sm" [disabled]="page >= pages" (click)="go(pages)" aria-label="Last page">»</button>
+    </div>
+    <label class="muted pager-size">Rows
+      <select [ngModel]="pageSize" (ngModelChange)="sizeChange.emit(+$event)">
+        <option *ngFor="let s of sizes" [ngValue]="s">{{ s }}</option>
+      </select>
+    </label>
+  </div>`
+})
+export class Pager {
+  @Input() total = 0;
+  @Input() page = 1;
+  @Input() pageSize = 10;
+  @Input() sizes = [10, 20, 50, 100];
+  @Output() pageChange = new EventEmitter<number>();
+  @Output() sizeChange = new EventEmitter<number>();
+  get pages() { return Math.max(1, Math.ceil(this.total / this.pageSize)); }
+  get from() { return this.total ? (this.page - 1) * this.pageSize + 1 : 0; }
+  get to() { return Math.min(this.total, this.page * this.pageSize); }
+  /** First, last and a window around the current page; 0 marks an ellipsis. */
+  get pagesToShow() {
+    const out: number[] = [];
+    for (let p = 1; p <= this.pages; p++) {
+      if (p === 1 || p === this.pages || Math.abs(p - this.page) <= 1) out.push(p);
+      else if (out[out.length - 1] !== 0) out.push(0);
+    }
+    return out;
+  }
+  go(p: number) { if (p >= 1 && p <= this.pages && p !== this.page) this.pageChange.emit(p); }
+}
+
+/** Slices a local array for client-side paged tables. */
+export function pageOf<T>(rows: T[], page: number, size: number): T[] { return rows.slice((page - 1) * size, page * size); }
 
 @Injectable({ providedIn: 'root' })
 export class Toast {
@@ -177,18 +232,19 @@ export class AdminAlerts {
 @Injectable({ providedIn: 'root' })
 export class CartStore {
   lines: Line[] = JSON.parse(localStorage.getItem('cart-products') || '[]');
-  constructor(private toast: Toast) {}
+  constructor(private toast: Toast, private api: Api) {}
   save() { localStorage.setItem('cart-products', JSON.stringify(this.lines)); }
   add(product: Product) {
     const line = this.lines.find(item => item.product.id === product.id);
     line ? line.quantity++ : this.lines.push({ product, quantity: 1 });
     this.save();
+    this.api.track('CartAdd', product.id, line ? line.quantity : 1);
     this.toast.show(`${product.name} added to your cart`);
   }
   remove(index: number) {
     const [removed] = this.lines.splice(index, 1);
     this.save();
-    if (removed) this.toast.show(`${removed.product.name} removed from your cart`);
+    if (removed) { this.api.track('CartRemove', removed.product.id); this.toast.show(`${removed.product.name} removed from your cart`); }
   }
   total() { return this.lines.reduce((sum, item) => sum + item.product.price * item.quantity, 0); }
 }
@@ -196,7 +252,7 @@ export class CartStore {
 @Injectable({ providedIn: 'root' })
 export class WishlistStore {
   items: Product[] = JSON.parse(localStorage.getItem('wishlist-products') || '[]');
-  constructor(private toast: Toast) {}
+  constructor(private toast: Toast, private api: Api) {}
   private save() { localStorage.setItem('wishlist-products', JSON.stringify(this.items)); }
   has(id: number) { return this.items.some(p => p.id === id); }
   /** Toggling keeps a single heart control in the UI for both add and remove. */
@@ -204,9 +260,11 @@ export class WishlistStore {
     const index = this.items.findIndex(p => p.id === product.id);
     if (index >= 0) {
       this.items.splice(index, 1);
+      this.api.track('WishlistRemove', product.id);
       this.toast.show(`${product.name} removed from your wishlist`);
     } else {
       this.items.push(product);
+      this.api.track('WishlistAdd', product.id);
       this.toast.show(`${product.name} saved to your wishlist`);
     }
     this.save();
@@ -416,8 +474,8 @@ export class InstallGuide {
 export class App {
   year = new Date().getFullYear();
   menuOpen = false;
-  constructor(public cart: CartStore, public toast: Toast, public auth: Auth, public wishlist: WishlistStore, public installService: AppInstall, private router: Router) {}
-  logout(event?: Event) { event?.preventDefault(); this.auth.logout(); this.toast.show('You have been signed out'); this.router.navigateByUrl('/'); }
+  constructor(public cart: CartStore, public toast: Toast, public auth: Auth, public wishlist: WishlistStore, public installService: AppInstall, private router: Router, private api: Api) {}
+  logout(event?: Event) { event?.preventDefault(); this.api.logout().subscribe(); this.auth.logout(); this.toast.show('You have been signed out'); this.router.navigateByUrl('/'); }
 }
 
 @Component({
@@ -1003,11 +1061,11 @@ export class Register {
 }
 
 @Component({
-  standalone: true, imports: [CommonModule, CurrencyPipe, DatePipe, RouterLink],
+  standalone: true, imports: [CommonModule, CurrencyPipe, DatePipe, RouterLink, Pager],
   template: `<div class="page"><div class="section-heading"><h1>My orders</h1><span class="order-head-links"><a routerLink="/payments" class="muted">Payment history</a><a routerLink="/shop" class="muted">Continue shopping →</a></span></div>
     <p *ngIf="error">{{ error }}</p>
     <p *ngIf="!error && !orders.length" class="muted">You have not placed any orders yet.</p>
-    <article class="order-card" *ngFor="let order of orders">
+    <article class="order-card" *ngFor="let order of pageOf(orders, page, size)">
       <div class="order-head">
         <div><strong>Order #{{ order.id }}</strong><span class="muted"> · {{ order.createdAt | date:'medium' }}</span></div>
         <span class="order-status">{{ order.status }}</span>
@@ -1035,12 +1093,13 @@ export class Register {
         <span class="muted" *ngIf="order.payment">Payment: {{ order.payment.status }}<span *ngIf="order.payment.cardLast4"> · {{ order.payment.cardBrand }} •••• {{ order.payment.cardLast4 }}</span> · {{ order.payment.transactionId }}</span>
         <strong class="price">Total: {{ order.total | currency }}</strong>
       </div>
-    </article></div>`
+    </article>
+    <app-pager [total]="orders.length" [page]="page" [pageSize]="size" [sizes]="[5, 10, 20]" (pageChange)="page = $event" (sizeChange)="size = $event; page = 1"></app-pager></div>`
 })
-export class Orders { orders: any[] = []; error = ''; constructor(api: Api) { api.orders().subscribe({ next: orders => this.orders = orders, error: () => this.error = 'Please sign in to view orders.' }); } }
+export class Orders { orders: any[] = []; error = ''; page = 1; size = 5; pageOf = pageOf; constructor(api: Api) { api.orders().subscribe({ next: orders => this.orders = orders, error: () => this.error = 'Please sign in to view orders.' }); } }
 
 @Component({
-  standalone: true, imports: [CommonModule, CurrencyPipe, DatePipe, RouterLink],
+  standalone: true, imports: [CommonModule, CurrencyPipe, DatePipe, RouterLink, Pager],
   template: `<div class="page"><div class="section-heading"><h1>Payment history</h1><a routerLink="/orders" class="muted">My orders →</a></div>
     <p *ngIf="error">{{ error }}</p>
     <p *ngIf="!error && loaded && !payments.length" class="muted">You have not made any payments yet.</p>
@@ -1052,7 +1111,7 @@ export class Orders { orders: any[] = []; error = ''; constructor(api: Api) { ap
       <table class="data-table">
         <thead><tr><th>Date</th><th>Order</th><th>Method</th><th>Reference</th><th>Status</th><th>Amount</th></tr></thead>
         <tbody>
-          <tr *ngFor="let p of payments">
+          <tr *ngFor="let p of pageOf(payments, page, size)">
             <td>{{ p.processedAt | date:'medium' }}</td>
             <td><a routerLink="/orders">#{{ p.orderId }}</a></td>
             <td>{{ label(p) }}<br><span class="muted" *ngIf="p.cardLast4">{{ p.cardBrand }} •••• {{ p.cardLast4 }}</span></td>
@@ -1065,10 +1124,11 @@ export class Orders { orders: any[] = []; error = ''; constructor(api: Api) { ap
         </tbody>
       </table>
     </div>
+    <app-pager [total]="payments.length" [page]="page" [pageSize]="size" (pageChange)="page = $event" (sizeChange)="size = $event; page = 1"></app-pager>
   </div>`
 })
 export class Payments {
-  payments: any[] = []; error = ''; loaded = false;
+  payments: any[] = []; error = ''; loaded = false; page = 1; size = 10; pageOf = pageOf;
   constructor(api: Api) {
     api.paymentHistory().subscribe({
       next: rows => { this.payments = rows || []; this.loaded = true; },
@@ -1081,8 +1141,10 @@ export class Payments {
   totalPaid() { return this.payments.filter(p => this.isPaid(p)).reduce((sum, p) => sum + p.amount - (p.refundedAmount || 0), 0); }
 }
 
+
+
 @Component({
-  standalone: true, imports: [CommonModule, FormsModule, DatePipe, CurrencyPipe],
+  standalone: true, imports: [CommonModule, FormsModule, DatePipe, CurrencyPipe, Pager],
   template: `<div class="page admin">
     <div class="section-heading">
       <div class="admin-title"><img class="admin-crest" src="assets/brand/logo.jpeg" alt="The Bathany"><div><div class="eyebrow">The Bathany</div><h1>Admin console</h1></div></div>
@@ -1118,8 +1180,8 @@ export class Payments {
       <h2>Latest orders</h2>
       <table class="data-table"><thead><tr><th>#</th><th>Customer</th><th>Total</th><th>Status</th><th>Placed</th></tr></thead>
         <tbody>
-          <tr *ngFor="let o of orders.slice(0, 5)"><td>#{{ o.id }}</td><td>{{ o.customer }}</td><td>{{ o.total | currency }}</td><td><span class="pill" [attr.data-status]="o.status">{{ o.status }}</span></td><td>{{ o.createdAt | date:'medium' }}</td></tr>
-          <tr *ngIf="!orders.length"><td colspan="5" class="muted">No orders yet.</td></tr>
+          <tr *ngFor="let o of latestOrders"><td>#{{ o.id }}</td><td>{{ o.customer }}</td><td>{{ o.total | currency }}</td><td><span class="pill" [attr.data-status]="o.status">{{ o.status }}</span></td><td>{{ o.createdAt | date:'medium' }}</td></tr>
+          <tr *ngIf="!latestOrders.length"><td colspan="5" class="muted">No orders yet.</td></tr>
         </tbody></table>
     </section>
 
@@ -1159,6 +1221,10 @@ export class Payments {
         </div>
       </form>
 
+      <div class="pay-filters table-filters">
+        <input [(ngModel)]="q.products.search" (keyup.enter)="reload('products', 1)" placeholder="Search name, description or #">
+        <button class="btn-light" (click)="reload('products', 1)">Search</button>
+      </div>
       <table class="data-table"><thead><tr><th>#</th><th>Name</th><th>Image</th><th>Category</th><th>Price</th><th>Stock</th><th>Status</th><th>Actions</th></tr></thead>
         <tbody>
           <tr *ngFor="let p of products">
@@ -1174,13 +1240,24 @@ export class Payments {
               <button class="link-btn danger" (click)="removeProduct(p)">Delete</button>
             </td>
           </tr>
-          <tr *ngIf="!products.length"><td colspan="8" class="muted">No products yet.</td></tr>
+          <tr *ngIf="!products.length"><td colspan="8" class="muted">No products found.</td></tr>
         </tbody></table>
+      <app-pager [total]="q.products.total" [page]="q.products.page" [pageSize]="q.products.size" (pageChange)="reload('products', $event)" (sizeChange)="resize('products', $event)"></app-pager>
     </section>
 
     <!-- Orders -->
     <section *ngIf="section === 'orders'">
-      <h2>Orders</h2>
+      <div class="admin-subhead">
+        <h2>Orders</h2>
+        <div class="pay-filters">
+          <input [(ngModel)]="q.orders.search" (keyup.enter)="reload('orders', 1)" placeholder="Order #, email, name or phone">
+          <select [(ngModel)]="q.orders.status" (ngModelChange)="reload('orders', 1)">
+            <option value="">All statuses</option>
+            <option *ngFor="let s of config.orderStatuses" [value]="s">{{ s }}</option>
+          </select>
+          <button class="btn-light" (click)="reload('orders', 1)">Search</button>
+        </div>
+      </div>
       <table class="data-table"><thead><tr><th>#</th><th>Customer</th><th>Deliver to</th><th>Items</th><th>Payment</th><th>Total</th><th>Status</th><th>Placed</th></tr></thead>
         <tbody>
           <tr *ngFor="let o of orders">
@@ -1204,8 +1281,9 @@ export class Payments {
             </td>
             <td>{{ o.createdAt | date:'medium' }}</td>
           </tr>
-          <tr *ngIf="!orders.length"><td colspan="8" class="muted">No orders yet.</td></tr>
+          <tr *ngIf="!orders.length"><td colspan="8" class="muted">No orders found.</td></tr>
         </tbody></table>
+      <app-pager [total]="q.orders.total" [page]="q.orders.page" [pageSize]="q.orders.size" (pageChange)="reload('orders', $event)" (sizeChange)="resize('orders', $event)"></app-pager>
     </section>
 
     <!-- Payments -->
@@ -1213,16 +1291,16 @@ export class Payments {
       <div class="admin-subhead">
         <h2>Payments</h2>
         <div class="pay-filters">
-          <input [(ngModel)]="paymentSearch" (keyup.enter)="loadPayments()" placeholder="Reference, customer or order #">
-          <select [(ngModel)]="paymentStatus" (ngModelChange)="loadPayments()">
+          <input [(ngModel)]="paymentSearch" (keyup.enter)="reload('payments', 1)" placeholder="Reference, customer or order #">
+          <select [(ngModel)]="paymentStatus" (ngModelChange)="reload('payments', 1)">
             <option value="">All statuses</option>
             <option *ngFor="let s of paymentData.statuses" [value]="s">{{ s }}</option>
           </select>
-          <select [(ngModel)]="paymentProvider" (ngModelChange)="loadPayments()">
+          <select [(ngModel)]="paymentProvider" (ngModelChange)="reload('payments', 1)">
             <option value="">All providers</option>
             <option *ngFor="let p of paymentData.providers" [value]="p">{{ p }}</option>
           </select>
-          <button class="btn-light" (click)="loadPayments()">Search</button>
+          <button class="btn-light" (click)="reload('payments', 1)">Search</button>
         </div>
       </div>
       <div class="admin-cards">
@@ -1246,12 +1324,23 @@ export class Payments {
           </tr>
           <tr *ngIf="!paymentData.items.length"><td colspan="8" class="muted">No payments match this filter.</td></tr>
         </tbody></table>
+      <app-pager [total]="q.payments.total" [page]="q.payments.page" [pageSize]="q.payments.size" (pageChange)="reload('payments', $event)" (sizeChange)="resize('payments', $event)"></app-pager>
     </section>
 
     <!-- Users -->
     <section *ngIf="section === 'users'">
-      <h2>Users</h2>
-      <table class="data-table"><thead><tr><th>#</th><th>Email</th><th>Name</th><th>Role</th><th>Joined</th><th>Password</th></tr></thead>
+      <div class="admin-subhead">
+        <h2>Users</h2>
+        <div class="pay-filters">
+          <input [(ngModel)]="q.users.search" (keyup.enter)="reload('users', 1)" placeholder="Email or name">
+          <select [(ngModel)]="q.users.role" (ngModelChange)="reload('users', 1)">
+            <option value="">All roles</option>
+            <option *ngFor="let r of config.roles" [value]="r">{{ r }}</option>
+          </select>
+          <button class="btn-light" (click)="reload('users', 1)">Search</button>
+        </div>
+      </div>
+      <table class="data-table"><thead><tr><th>#</th><th>Email</th><th>Name</th><th>Role</th><th>Orders</th><th>Last login</th><th>Joined</th><th>Actions</th></tr></thead>
         <tbody>
           <tr *ngFor="let u of users">
             <td>{{ u.id }}</td><td>{{ u.email }}</td><td>{{ u.displayName }}</td>
@@ -1260,8 +1349,11 @@ export class Payments {
                 <option *ngFor="let r of config.roles" [value]="r">{{ r }}</option>
               </select>
             </td>
+            <td>{{ u.orders }}</td>
+            <td><span *ngIf="u.lastLogin; else never">{{ u.lastLogin.createdAt | date:'medium' }}<br><span class="muted ip">IP {{ u.lastLogin.ipAddress || '—' }}</span></span><ng-template #never><span class="muted">Never</span></ng-template></td>
             <td>{{ u.createdAt | date:'mediumDate' }}</td>
             <td>
+              <button class="link-btn" (click)="viewUserActivity(u)">Activity</button>
               <button class="link-btn" *ngIf="resetFor !== u.id" (click)="startReset(u.id)">Reset password</button>
               <span class="admin-reset" *ngIf="resetFor === u.id">
                 <input type="password" [(ngModel)]="newPassword" placeholder="New password">
@@ -1270,18 +1362,39 @@ export class Payments {
               </span>
             </td>
           </tr>
-          <tr *ngIf="!users.length"><td colspan="6" class="muted">No users yet.</td></tr>
+          <tr *ngIf="!users.length"><td colspan="8" class="muted">No users found.</td></tr>
         </tbody></table>
+      <app-pager [total]="q.users.total" [page]="q.users.page" [pageSize]="q.users.size" (pageChange)="reload('users', $event)" (sizeChange)="resize('users', $event)"></app-pager>
     </section>
 
     <!-- Activity -->
     <section *ngIf="section === 'activity'">
-      <h2>Activity log</h2>
-      <table class="data-table"><thead><tr><th>#</th><th>Action</th><th>Details</th><th>User</th><th>When</th></tr></thead>
+      <div class="admin-subhead">
+        <h2>User activity</h2>
+        <div class="pay-filters">
+          <input [(ngModel)]="q.activity.search" (keyup.enter)="reload('activity', 1)" placeholder="Email, IP or details">
+          <select [(ngModel)]="q.activity.action" (ngModelChange)="reload('activity', 1)">
+            <option value="">All activity</option>
+            <option *ngFor="let a of activityActions" [value]="a">{{ a }}</option>
+          </select>
+          <button class="btn-light" (click)="reload('activity', 1)">Search</button>
+        </div>
+      </div>
+      <p class="admin-flash" *ngIf="q.activity.userId">Showing activity for {{ q.activity.userLabel }} · <button class="link-btn" (click)="clearUserFilter()">Show everyone</button></p>
+      <table class="data-table"><thead><tr><th>#</th><th>Action</th><th>Details</th><th>User</th><th>IP address</th><th>Device</th><th>When</th></tr></thead>
         <tbody>
-          <tr *ngFor="let a of activity"><td>{{ a.id }}</td><td><span class="pill" data-status="Active">{{ a.action }}</span></td><td>{{ a.details }}</td><td>{{ a.userId || '—' }}</td><td>{{ a.createdAt | date:'medium' }}</td></tr>
-          <tr *ngIf="!activity.length"><td colspan="5" class="muted">No activity recorded.</td></tr>
+          <tr *ngFor="let a of activity">
+            <td>{{ a.id }}</td>
+            <td><span class="pill" [attr.data-status]="actionTone(a.action)">{{ a.action }}</span></td>
+            <td>{{ a.details }}</td>
+            <td><span *ngIf="a.userEmail; else guest">{{ a.userEmail }}<br><span class="muted">#{{ a.userId }}</span></span><ng-template #guest><span class="muted">Guest</span></ng-template></td>
+            <td><span class="ip">{{ a.ipAddress || '—' }}</span></td>
+            <td><span class="muted" [title]="a.userAgent">{{ device(a.userAgent) }}</span></td>
+            <td>{{ a.createdAt | date:'medium' }}</td>
+          </tr>
+          <tr *ngIf="!activity.length"><td colspan="7" class="muted">No activity recorded.</td></tr>
         </tbody></table>
+      <app-pager [total]="q.activity.total" [page]="q.activity.page" [pageSize]="q.activity.size" (pageChange)="reload('activity', $event)" (sizeChange)="resize('activity', $event)"></app-pager>
     </section>
   </div>`
 })
@@ -1304,7 +1417,16 @@ export class Admin implements OnDestroy {
   };
   section = 'dashboard';
   stats: any = {};
-  products: any[] = []; orders: any[] = []; users: any[] = []; activity: any[] = [];
+  products: any[] = []; orders: any[] = []; users: any[] = []; activity: any[] = []; latestOrders: any[] = [];
+  activityActions: string[] = [];
+  /** Per-table paging and filter state. Every admin table is paged on the server. */
+  q: any = {
+    products: { page: 1, size: 10, total: 0, search: '' },
+    orders: { page: 1, size: 10, total: 0, search: '', status: '' },
+    payments: { page: 1, size: 10, total: 0 },
+    users: { page: 1, size: 10, total: 0, search: '', role: '' },
+    activity: { page: 1, size: 20, total: 0, search: '', action: '', userId: null, userLabel: '' }
+  };
   paymentData: any = { summary: {}, items: [], providers: [], statuses: [] };
   paymentSearch = ''; paymentStatus = ''; paymentProvider = '';
   editing: any = null;
@@ -1373,25 +1495,61 @@ export class Admin implements OnDestroy {
     this.error = '';
     this.loadConfig();
     this.api.admin('stats').subscribe({ next: s => this.stats = s, error: () => this.error = 'Sign in as an admin to load data.' });
-    this.api.admin('products').subscribe({ next: d => this.products = d, error: () => this.products = [] });
-    this.api.admin('orders').subscribe({ next: d => this.orders = d, error: () => this.orders = [] });
-    this.api.admin('users').subscribe({ next: d => this.users = d, error: () => this.users = [] });
-    this.api.admin('activity').subscribe({ next: d => this.activity = d, error: () => this.activity = [] });
-    this.loadPayments();
+    this.api.admin('orders?page=1&pageSize=5').subscribe({ next: d => this.latestOrders = d.items || [], error: () => this.latestOrders = [] });
+    (['products', 'orders', 'users', 'activity', 'payments'] as const).forEach(t => this.reload(t));
     this.lastLoaded = new Date();
   }
 
-  loadPayments() {
-    const params = new URLSearchParams();
-    if (this.paymentStatus) params.set('status', this.paymentStatus);
-    if (this.paymentProvider) params.set('provider', this.paymentProvider);
-    if (this.paymentSearch.trim()) params.set('search', this.paymentSearch.trim());
-    const query = params.toString();
-    this.api.admin(`payments${query ? '?' + query : ''}`).subscribe({
-      next: d => this.paymentData = { summary: d.summary || {}, items: d.items || [], providers: d.providers || [], statuses: d.statuses || [] },
-      error: () => this.paymentData = { summary: {}, items: [], providers: [], statuses: [] }
+  private queryFor(table: string): string {
+    const s = this.q[table];
+    const params = new URLSearchParams({ page: String(s.page), pageSize: String(s.size) });
+    const set = (k: string, v: any) => { if (v !== null && v !== undefined && String(v).trim()) params.set(k, String(v).trim()); };
+    if (table === 'payments') { set('status', this.paymentStatus); set('provider', this.paymentProvider); set('search', this.paymentSearch); }
+    else { set('search', s.search); set('status', s.status); set('role', s.role); set('action', s.action); set('userId', s.userId); }
+    return `${table}?${params}`;
+  }
+
+  /** Fetch one table's page. Passing a page number jumps there (filters reset to page 1). */
+  reload(table: string, page?: number) {
+    const s = this.q[table];
+    if (page) s.page = page;
+    this.api.admin(this.queryFor(table)).subscribe({
+      next: d => {
+        s.total = d.total ?? 0; s.page = d.page ?? s.page;
+        const items = d.items || [];
+        if (table === 'payments') this.paymentData = { summary: d.summary || {}, items, providers: d.providers || [], statuses: d.statuses || [] };
+        else if (table === 'activity') { this.activity = items; this.activityActions = d.actions || []; }
+        else (this as any)[table] = items;
+      },
+      error: () => { s.total = 0; if (table === 'payments') this.paymentData = { summary: {}, items: [], providers: [], statuses: [] }; else (this as any)[table] = []; }
     });
   }
+
+  resize(table: string, size: number) { this.q[table].size = size; this.reload(table, 1); }
+
+  viewUserActivity(u: any) {
+    Object.assign(this.q.activity, { userId: u.id, userLabel: u.email, action: '', search: '' });
+    this.section = 'activity';
+    this.reload('activity', 1);
+  }
+  clearUserFilter() { Object.assign(this.q.activity, { userId: null, userLabel: '' }); this.reload('activity', 1); }
+
+  actionTone(action: string) {
+    if (/Failed|Deleted|Deactivated|Remove/i.test(action)) return 'Cancelled';
+    if (/Login|Register|Checkout/i.test(action)) return 'Paid';
+    if (/Logout/i.test(action)) return 'Pending';
+    return 'Active';
+  }
+
+  /** A short readable device label from the user agent; the full string is in the tooltip. */
+  device(ua: string) {
+    if (!ua) return '—';
+    const os = /Android/i.test(ua) ? 'Android' : /iPhone|iPad|iPod/i.test(ua) ? 'iOS' : /Windows/i.test(ua) ? 'Windows' : /Mac OS/i.test(ua) ? 'macOS' : /Linux/i.test(ua) ? 'Linux' : '';
+    const browser = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : /curl/i.test(ua) ? 'curl' : 'Other';
+    return os ? `${browser} · ${os}` : browser;
+  }
+
+  loadPayments() { this.reload('payments', 1); }
 
   private flash(text: string) { this.message = text; this.error = ''; setTimeout(() => this.message = '', 4000); }
   private fail(err: any, fallbackText: string) { this.saving = false; this.error = err?.error?.detail || err?.error?.title || fallbackText; }

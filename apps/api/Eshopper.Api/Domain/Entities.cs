@@ -75,7 +75,17 @@ public class Payment
     public decimal RefundedAmount { get; set; }
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 }
-public class AuditActivity { public int Id { get; set; } public int? UserId { get; set; } public string Action { get; set; } = ""; public string Details { get; set; } = ""; public DateTime CreatedAt { get; set; } = DateTime.UtcNow; }
+public class AuditActivity
+{
+    public int Id { get; set; }
+    public int? UserId { get; set; }
+    public string Action { get; set; } = "";
+    public string Details { get; set; } = "";
+    /// <summary>Client IP (behind the proxy, from X-Forwarded-For). Stamped automatically on save.</summary>
+    public string IpAddress { get; set; } = "";
+    public string UserAgent { get; set; } = "";
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
 public class PasswordResetToken
 {
     public int Id { get; set; }

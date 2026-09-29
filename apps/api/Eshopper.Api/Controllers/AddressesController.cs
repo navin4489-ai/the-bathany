@@ -52,6 +52,7 @@ public class AddressesController(ShopDbContext db) : ControllerBase
         Apply(address, request);
         address.IsDefault = request.IsDefault || isFirst;
         db.SavedAddresses.Add(address);
+        db.AuditActivities.Add(new AuditActivity { UserId = userId, Action = "AddressAdded", Details = $"Added address {address.FullName}, {address.City} {address.PostalCode}" });
         await db.SaveChangesAsync();
         if (address.IsDefault) await MakeSoleDefault(userId, address.Id);
         return Ok(ToDto(address));
@@ -68,6 +69,7 @@ public class AddressesController(ShopDbContext db) : ControllerBase
         Apply(address, request);
         address.UpdatedAt = DateTime.UtcNow;
         if (request.IsDefault) address.IsDefault = true;
+        db.AuditActivities.Add(new AuditActivity { UserId = userId, Action = "AddressUpdated", Details = $"Updated address #{id} ({address.City} {address.PostalCode})" });
         await db.SaveChangesAsync();
         if (address.IsDefault) await MakeSoleDefault(userId, address.Id);
         return Ok(ToDto(address));
@@ -90,6 +92,7 @@ public class AddressesController(ShopDbContext db) : ControllerBase
         if (address is null) return NotFound();
         var wasDefault = address.IsDefault;
         db.SavedAddresses.Remove(address);
+        db.AuditActivities.Add(new AuditActivity { UserId = userId, Action = "AddressDeleted", Details = $"Removed address #{id} ({address.City} {address.PostalCode})" });
         await db.SaveChangesAsync();
 
         // Never leave the book without a default, or checkout would have nothing preselected.

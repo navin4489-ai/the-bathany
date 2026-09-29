@@ -40,7 +40,14 @@ public class AuthController(ShopDbContext db, IConfiguration config, IPasswordSe
     {
         var email = (request.Email ?? "").Trim().ToLowerInvariant();
         var user = await db.Users.AsNoTracking().SingleOrDefaultAsync(x => x.Email == email);
-        if (user is null || !passwords.Verify(request.Password ?? "", user.PasswordHash)) return Unauthorized();
+        if (user is null || !passwords.Verify(request.Password ?? "", user.PasswordHash))
+        {
+            db.AuditActivities.Add(new AuditActivity { UserId = user?.Id, Action = "LoginFailed", Details = $"Failed sign-in for {Truncate(email, 200)}" });
+            await db.SaveChangesAsync();
+            return Unauthorized();
+        }
+        db.AuditActivities.Add(new AuditActivity { UserId = user.Id, Action = "Login", Details = $"{user.Email} signed in" });
+        await db.SaveChangesAsync();
         var key = config["Jwt:SigningKey"];
         if (string.IsNullOrWhiteSpace(key)) return Problem("JWT signing key is not configured.");
         var claims = new[]
@@ -53,6 +60,18 @@ public class AuthController(ShopDbContext db, IConfiguration config, IPasswordSe
         var credentials = new SigningCredentials(new SymmetricSecurityKey(Encoding.UTF8.GetBytes(key)), SecurityAlgorithms.HmacSha256);
         var token = new JwtSecurityToken(config["Jwt:Issuer"], config["Jwt:Audience"], claims, expires: DateTime.UtcNow.AddHours(2), signingCredentials: credentials);
         return Ok(new { accessToken = new JwtSecurityTokenHandler().WriteToken(token), user.Id, user.Email, user.DisplayName, user.Role });
+    }
+
+    private static string Truncate(string value, int max) => value.Length > max ? value[..max] : value;
+
+    /// <summary>JWTs are stateless, so this only records the sign-out; the client discards its token.</summary>
+    [HttpPost("logout"), Authorize]
+    public async Task<IActionResult> Logout()
+    {
+        if (!int.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out var userId)) return Unauthorized();
+        db.AuditActivities.Add(new AuditActivity { UserId = userId, Action = "Logout", Details = $"{User.FindFirstValue(ClaimTypes.Email)} signed out" });
+        await db.SaveChangesAsync();
+        return Ok();
     }
 
     /// <summary>

@@ -20,6 +20,16 @@ if (builder.Configuration["Database:Provider"] == "InMemory")
 else
     builder.Services.AddDbContext<ShopDbContext>(o =>
         o.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"), sql => sql.CommandTimeout(10)));
+builder.Services.AddHttpContextAccessor();
+// Traefik terminates TLS and forwards the real client address. Only the proxy-appended (last) hop is
+// trusted, so a client cannot spoof its logged IP by sending its own X-Forwarded-For header.
+builder.Services.Configure<Microsoft.AspNetCore.Builder.ForwardedHeadersOptions>(o =>
+{
+    o.ForwardedHeaders = Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedFor | Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedProto;
+    o.ForwardLimit = 1;
+    o.KnownNetworks.Clear();
+    o.KnownProxies.Clear();
+});
 builder.Services.AddScoped<ICatalogService, CatalogService>();
 builder.Services.AddScoped<ICheckoutService, CheckoutService>();
 builder.Services.AddSingleton<IPaymentGateway, DummyPaymentGateway>();
@@ -42,6 +52,7 @@ builder.Services.AddAuthorization(o => o.AddPolicy("AdminOnly", p => p.RequireRo
 builder.Services.AddCors(o => o.AddDefaultPolicy(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 
 var app = builder.Build();
+app.UseForwardedHeaders();
 if (app.Configuration["Database:Provider"] == "InMemory")
 {
     using var scope = app.Services.CreateScope();
