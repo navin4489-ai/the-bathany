@@ -30,8 +30,51 @@ public class ShippingAddress
     public string Country { get; set; } = "India";
     public string Landmark { get; set; } = "";
 }
+/// <summary>
+/// An address in the shopper's reusable address book. Kept separate from <see cref="ShippingAddress"/>
+/// so editing or deleting a saved address never rewrites the address a past order was shipped to.
+/// </summary>
+public class SavedAddress
+{
+    public int Id { get; set; }
+    public int UserId { get; set; }
+    public string FullName { get; set; } = "";
+    public string Phone { get; set; } = "";
+    public string Line1 { get; set; } = "";
+    public string Line2 { get; set; } = "";
+    public string City { get; set; } = "";
+    public string State { get; set; } = "";
+    public string PostalCode { get; set; } = "";
+    public string Country { get; set; } = "India";
+    public string Landmark { get; set; } = "";
+    /// <summary>Exactly one address per shopper carries this flag; it is preselected at checkout.</summary>
+    public bool IsDefault { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+}
 public class OrderItem { public int Id { get; set; } public int OrderId { get; set; } public int ProductId { get; set; } public string ProductName { get; set; } = ""; public decimal UnitPrice { get; set; } public int Quantity { get; set; } }
-public class Payment { public int Id { get; set; } public int OrderId { get; set; } public decimal Amount { get; set; } public string Status { get; set; } = ""; public string TransactionId { get; set; } = ""; public string Method { get; set; } = "Card"; public string CardBrand { get; set; } = ""; public string CardLast4 { get; set; } = ""; public string FailureReason { get; set; } = ""; public DateTime ProcessedAt { get; set; } = DateTime.UtcNow; }
+public class Payment
+{
+    public int Id { get; set; }
+    public int OrderId { get; set; }
+    public decimal Amount { get; set; }
+    public string Status { get; set; } = "";
+    public string TransactionId { get; set; } = "";
+    public string Method { get; set; } = "Card";
+    public string CardBrand { get; set; } = "";
+    public string CardLast4 { get; set; } = "";
+    public string FailureReason { get; set; } = "";
+    public DateTime ProcessedAt { get; set; } = DateTime.UtcNow;
+    /// <summary>Which gateway handled this payment: "razorpay" for live processing, "simulated" for the test gateway.</summary>
+    public string Provider { get; set; } = "simulated";
+    /// <summary>Gateway order handle (Razorpay order_...), used to reconcile against the provider dashboard.</summary>
+    public string ProviderOrderId { get; set; } = "";
+    /// <summary>Gateway payment handle (Razorpay pay_...); the reference to quote in a refund or dispute.</summary>
+    public string ProviderPaymentId { get; set; } = "";
+    public string Currency { get; set; } = "INR";
+    public decimal RefundedAmount { get; set; }
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+}
 public class AuditActivity { public int Id { get; set; } public int? UserId { get; set; } public string Action { get; set; } = ""; public string Details { get; set; } = ""; public DateTime CreatedAt { get; set; } = DateTime.UtcNow; }
 public class PasswordResetToken
 {

@@ -5,7 +5,9 @@ using Microsoft.EntityFrameworkCore;
 namespace Eshopper.Api.Services;
 public record ProductDto(int Id, string Name, string Description, decimal Price, int Stock, string ImageUrl, int CategoryId);
 public record CartLine(int ProductId, int Quantity);
-public record CheckoutRequest(IReadOnlyList<CartLine> Items, string IdempotencyKey, string? PaymentToken = null, string? PaymentMethod = null, CardDetails? Card = null, ShippingAddressRequest? ShippingAddress = null);
+public record CheckoutRequest(IReadOnlyList<CartLine> Items, string IdempotencyKey, string? PaymentToken = null, string? PaymentMethod = null, CardDetails? Card = null, ShippingAddressRequest? ShippingAddress = null, RazorpayConfirmation? Razorpay = null);
+/// <summary>Values handed back by the Razorpay checkout widget; all three are required to verify a payment.</summary>
+public record RazorpayConfirmation(string? OrderId = null, string? PaymentId = null, string? Signature = null);
 public record ShippingAddressRequest(string? FullName = null, string? Phone = null, string? Line1 = null, string? Line2 = null, string? City = null, string? State = null, string? PostalCode = null, string? Country = null, string? Landmark = null);
 public interface ICatalogService { Task<IReadOnlyList<ProductDto>> GetProducts(string? search, int? categoryId); Task<ProductDto?> GetProduct(int id); }
 public class CatalogService(ShopDbContext db) : ICatalogService
@@ -126,8 +128,10 @@ public class DummyPaymentGateway : IPaymentGateway
     }
 }
 public interface ICheckoutService { Task<(Order? Order, string? Error)> Checkout(int userId, CheckoutRequest request); }
-public class CheckoutService(ShopDbContext db, IPaymentGateway gateway) : ICheckoutService
+public class CheckoutService(ShopDbContext db, IPaymentGateway gateway, IRazorpayGateway razorpay, IEmailService email) : ICheckoutService
 {
+    public const string RazorpayMethod = "razorpay";
+
     public async Task<(Order? Order, string? Error)> Checkout(int userId, CheckoutRequest request)
     {
         if (request.Items is null || request.Items.Count == 0 || string.IsNullOrWhiteSpace(request.IdempotencyKey)) return (null, "Items and IdempotencyKey are required.");
@@ -136,6 +140,39 @@ public class CheckoutService(ShopDbContext db, IPaymentGateway gateway) : ICheck
         if (existing is not null) return (existing, null);
         var products = await db.Products.Where(p => request.Items.Select(i => i.ProductId).Contains(p.Id)).ToDictionaryAsync(p => p.Id);
         if (products.Count != request.Items.Select(i => i.ProductId).Distinct().Count() || request.Items.Any(i => i.Quantity < 1 || products[i.ProductId].Stock < i.Quantity)) return (null, "Product unavailable or invalid quantity.");
+
+        var method = (request.PaymentMethod ?? DummyPaymentGateway.Card).Trim().ToLowerInvariant();
+        var isRazorpay = method == RazorpayMethod;
+        if (isRazorpay && !razorpay.Enabled) return (null, "Online payment is temporarily unavailable. Please choose another method.");
+        // Once Razorpay is live it is the only accepted method; the simulated gateway is a
+        // development fallback and must not be reachable by crafting a request.
+        if (!isRazorpay && razorpay.Enabled) return (null, "Please pay online to complete your order.");
+
+        // The total is always recomputed here from current database prices, so the amount verified
+        // against the gateway is our figure and never one supplied by the browser.
+        var total = request.Items.Sum(line => products[line.ProductId].Price * line.Quantity);
+
+        // A Razorpay payment is confirmed with the provider *before* any stock is touched, so a
+        // failed verification cannot leave reserved stock or a half-finished order behind.
+        RazorpayVerification? verified = null;
+        if (isRazorpay)
+        {
+            var confirmation = request.Razorpay;
+            if (confirmation is null) return (null, "The payment confirmation was missing. No charge was recorded.");
+            // Guard against a replayed payment being used to claim a second order.
+            if (await db.Payments.AnyAsync(p => p.ProviderPaymentId == confirmation.PaymentId))
+                return (null, "This payment has already been used for another order.");
+            try
+            {
+                verified = await razorpay.VerifyAsync(confirmation.OrderId ?? "", confirmation.PaymentId ?? "", confirmation.Signature ?? "", total);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+            {
+                return (null, "We could not reach the payment provider to confirm your payment. Please contact support before retrying.");
+            }
+            if (!verified.Success) return (null, verified.Error);
+        }
+
         await using var tx = await db.Database.BeginTransactionAsync();
         var order = new Order { UserId = userId, IdempotencyKey = request.IdempotencyKey };
         var a = request.ShippingAddress!;
@@ -147,27 +184,59 @@ public class CheckoutService(ShopDbContext db, IPaymentGateway gateway) : ICheck
             Landmark = a.Landmark?.Trim() ?? ""
         };
         foreach (var line in request.Items) { var p = products[line.ProductId]; p.Stock -= line.Quantity; order.Items.Add(new OrderItem { ProductId = p.Id, ProductName = p.Name, UnitPrice = p.Price, Quantity = line.Quantity }); order.Total += p.Price * line.Quantity; }
-        PaymentResult result;
-        try { result = gateway.Charge(order.Total, new PaymentRequest(request.PaymentMethod ?? DummyPaymentGateway.Card, request.PaymentToken, request.Card)); }
-        catch (InvalidOperationException ex) { await tx.RollbackAsync(); return (null, ex.Message); }
 
-        if (!result.Success)
+        if (verified is not null)
         {
-            // Release the reserved stock, but keep the failed order for the audit trail.
-            foreach (var line in request.Items) products[line.ProductId].Stock += line.Quantity;
-            order.Status = "PaymentFailed";
+            order.Status = verified.Captured ? "Paid" : "AwaitingPayment";
+            order.Payment = new Payment
+            {
+                Amount = order.Total,
+                Status = verified.Captured ? "Approved" : "Authorized",
+                TransactionId = verified.PaymentId,
+                Method = verified.Method,
+                CardBrand = verified.CardBrand,
+                CardLast4 = verified.CardLast4,
+                FailureReason = "",
+                Provider = RazorpayMethod,
+                ProviderOrderId = verified.OrderId,
+                ProviderPaymentId = verified.PaymentId,
+                Currency = verified.Currency
+            };
+            db.AuditActivities.Add(new AuditActivity { UserId = userId, Action = "Checkout", Details = $"Order total {order.Total:0.00} via Razorpay {verified.Method} ({verified.ProviderStatus}) ref {verified.PaymentId}" });
         }
-        else order.Status = result.Status == "Pending" ? "AwaitingPayment" : "Paid";
+        else
+        {
+            PaymentResult result;
+            try { result = gateway.Charge(order.Total, new PaymentRequest(method, request.PaymentToken, request.Card)); }
+            catch (InvalidOperationException ex) { await tx.RollbackAsync(); return (null, ex.Message); }
 
-        order.Payment = new Payment { Amount = order.Total, Status = result.Status, TransactionId = result.TransactionId, Method = result.Method, CardBrand = result.CardBrand, CardLast4 = result.CardLast4, FailureReason = result.FailureReason };
+            if (!result.Success)
+            {
+                // Release the reserved stock, but keep the failed order for the audit trail.
+                foreach (var line in request.Items) products[line.ProductId].Stock += line.Quantity;
+                order.Status = "PaymentFailed";
+            }
+            else order.Status = result.Status == "Pending" ? "AwaitingPayment" : "Paid";
+
+            order.Payment = new Payment { Amount = order.Total, Status = result.Status, TransactionId = result.TransactionId, Method = result.Method, CardBrand = result.CardBrand, CardLast4 = result.CardLast4, FailureReason = result.FailureReason, Provider = "simulated" };
+            db.AuditActivities.Add(new AuditActivity { UserId = userId, Action = "Checkout", Details = $"Order total {order.Total:0.00} via {result.Method} ({result.Status})" });
+        }
+
         db.Orders.Add(order);
-        db.AuditActivities.Add(new AuditActivity { UserId = userId, Action = "Checkout", Details = $"Order total {order.Total:0.00} via {result.Method} ({result.Status})" });
         await db.SaveChangesAsync(); await tx.CommitAsync();
+
+        // Confirmation mail is best-effort and deliberately after the commit: a mail failure
+        // must never roll back an order the shopper has already paid for.
+        if (order.Status is "Paid" or "AwaitingPayment")
+        {
+            var customerEmail = await db.Users.AsNoTracking().Where(u => u.Id == userId).Select(u => u.Email).SingleOrDefaultAsync();
+            if (!string.IsNullOrWhiteSpace(customerEmail)) await email.SendOrderPlacedAsync(order, customerEmail);
+        }
         return (order, null);
     }
 
     /// <summary>Delivery details are mandatory: an order that cannot be shipped must never be charged.</summary>
-    private static string? ValidateAddress(ShippingAddressRequest? a)
+    public static string? ValidateAddress(ShippingAddressRequest? a)
     {
         if (a is null) return "A shipping address is required.";
         if (string.IsNullOrWhiteSpace(a.FullName)) return "Recipient name is required.";

@@ -24,6 +24,13 @@ builder.Services.AddScoped<ICatalogService, CatalogService>();
 builder.Services.AddScoped<ICheckoutService, CheckoutService>();
 builder.Services.AddSingleton<IPaymentGateway, DummyPaymentGateway>();
 builder.Services.AddSingleton<IPasswordService, PasswordService>();
+var razorpayOptions = builder.Configuration.GetSection("Razorpay").Get<RazorpayOptions>() ?? new RazorpayOptions();
+builder.Services.AddSingleton(razorpayOptions);
+// A short timeout keeps a slow gateway from holding a checkout request open indefinitely.
+builder.Services.AddHttpClient<IRazorpayGateway, RazorpayGateway>(c => c.Timeout = TimeSpan.FromSeconds(20));
+var emailOptions = builder.Configuration.GetSection("Email").Get<EmailOptions>() ?? new EmailOptions();
+builder.Services.AddSingleton(emailOptions);
+builder.Services.AddSingleton<IEmailService, EmailService>();
 var jwt = builder.Configuration.GetSection("Jwt");
 var signingKey = jwt["SigningKey"] ?? throw new InvalidOperationException("Jwt:SigningKey is required.");
 if (signingKey.Length < 32) throw new InvalidOperationException("Jwt:SigningKey must be at least 32 characters.");

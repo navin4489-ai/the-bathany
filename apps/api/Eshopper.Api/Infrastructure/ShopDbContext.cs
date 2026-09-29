@@ -11,6 +11,7 @@ public class ShopDbContext(DbContextOptions<ShopDbContext> options) : DbContext(
     public DbSet<ProductImage> ProductImages => Set<ProductImage>();
     public DbSet<PasswordResetToken> PasswordResetTokens => Set<PasswordResetToken>();
     public DbSet<ShippingAddress> ShippingAddresses => Set<ShippingAddress>();
+    public DbSet<SavedAddress> SavedAddresses => Set<SavedAddress>();
     protected override void OnModelCreating(ModelBuilder b)
     {
         b.Entity<User>().HasIndex(x => x.Email).IsUnique();
@@ -19,10 +20,14 @@ public class ShopDbContext(DbContextOptions<ShopDbContext> options) : DbContext(
         b.Entity<Product>().Property(x => x.Price).HasPrecision(18, 2);
         b.Entity<Order>().Property(x => x.Total).HasPrecision(18, 2);
         b.Entity<Payment>().Property(x => x.Amount).HasPrecision(18, 2);
+        b.Entity<Payment>().Property(x => x.RefundedAmount).HasPrecision(18, 2);
+        b.Entity<Payment>().HasIndex(x => x.ProviderOrderId);
+        b.Entity<Payment>().HasIndex(x => x.ProviderPaymentId);
         b.Entity<OrderItem>().Property(x => x.UnitPrice).HasPrecision(18, 2);
         b.Entity<Order>().HasMany(x => x.Items).WithOne().HasForeignKey(x => x.OrderId);
         b.Entity<Order>().HasOne(x => x.Payment).WithOne().HasForeignKey<Payment>(x => x.OrderId);
         b.Entity<Order>().HasOne(x => x.ShippingAddress).WithOne().HasForeignKey<ShippingAddress>(x => x.OrderId);
+        b.Entity<SavedAddress>().HasIndex(x => x.UserId);
         b.Entity<Category>().HasData(new Category { Id = 1, Name = "Bath Rituals" }, new Category { Id = 2, Name = "Whipped Soaps" });
         b.Entity<User>().HasData(new User { Id = 1, Email = "admin@eshopper.local", DisplayName = "Store Admin", PasswordHash = "pbkdf2-sha256$120000$AAAAAAAAAAAAAAAAAAAAAA==$kX0KA5ypCZRdRwh7WSQbRvTskwDcvaj+dluN4LtUvzo=", Role = "Admin", CreatedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc) });
         b.Entity<Product>().HasData(

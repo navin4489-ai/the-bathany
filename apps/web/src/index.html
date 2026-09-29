@@ -5,11 +5,137 @@
   <title>The Bathany — Botanical Bath Rituals</title>
   <meta name="description" content="The Bathany: small-batch whipped soaps, bath clouds and botanical potions, handcrafted in India. All natural, cruelty free, sulfate free.">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#a07d16">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="The Bathany">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
   <link rel="icon" type="image/jpeg" href="assets/brand/logo.jpeg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&family=Jost:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&amp;family=Jost:wght@300;400;500;600&amp;display=swap" rel="stylesheet">
   <base href="/">
+  <link rel="manifest" href="manifest.webmanifest">
+  <!-- iOS has no manifest-driven launch screen, so supply an exact-resolution image per device. -->
+  <link rel="apple-touch-startup-image" href="splash/splash-640x1136.png" media="(device-width: 320px) and (device-height: 568px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1136x640.png" media="(device-width: 320px) and (device-height: 568px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-750x1334.png" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1334x750.png" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1242x2208.png" media="(device-width: 414px) and (device-height: 736px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2208x1242.png" media="(device-width: 414px) and (device-height: 736px) and (-webkit-device-pixel-ratio: 3) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1125x2436.png" media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2436x1125.png" media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-828x1792.png" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1792x828.png" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1242x2688.png" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2688x1242.png" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1170x2532.png" media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2532x1170.png" media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1284x2778.png" media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2778x1284.png" media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1179x2556.png" media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2556x1179.png" media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1290x2796.png" media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2796x1290.png" media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1206x2622.png" media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2622x1206.png" media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1320x2868.png" media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2868x1320.png" media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1536x2048.png" media="(device-width: 768px) and (device-height: 1024px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2048x1536.png" media="(device-width: 768px) and (device-height: 1024px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1620x2160.png" media="(device-width: 810px) and (device-height: 1080px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2160x1620.png" media="(device-width: 810px) and (device-height: 1080px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1640x2360.png" media="(device-width: 820px) and (device-height: 1180px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2360x1640.png" media="(device-width: 820px) and (device-height: 1180px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1668x2224.png" media="(device-width: 834px) and (device-height: 1112px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2224x1668.png" media="(device-width: 834px) and (device-height: 1112px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-1668x2388.png" media="(device-width: 834px) and (device-height: 1194px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2388x1668.png" media="(device-width: 834px) and (device-height: 1194px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2048x2732.png" media="(device-width: 1024px) and (device-height: 1366px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="splash/splash-2732x2048.png" media="(device-width: 1024px) and (device-height: 1366px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)">
+  <!-- Inlined so the splash paints on the very first frame, before styles.css or main.js arrive. -->
+  <style>
+    #app-splash {
+      position: fixed; inset: 0; z-index: 9999; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 22px;
+      background: #faf6ef; font-family: "Jost", "Poppins", sans-serif;
+      transition: opacity .45s ease, visibility .45s ease;
+    }
+    #app-splash.is-hidden { opacity: 0; visibility: hidden; pointer-events: none; }
+    .splash-mark { position: relative; width: 132px; height: 132px; display: grid; place-items: center; }
+    .splash-ring {
+      position: absolute; inset: 0; border-radius: 50%;
+      border: 3px solid rgba(201, 162, 39, .22); border-top-color: #c9a227;
+      animation: splash-spin 1.1s linear infinite;
+    }
+    .splash-ring.delayed {
+      inset: 13px; border-width: 2px; border-top-color: transparent; border-left-color: #a07d16;
+      animation-duration: 1.7s; animation-direction: reverse;
+    }
+    .splash-logo {
+      width: 84px; height: 84px; border-radius: 50%; object-fit: cover;
+      animation: splash-pulse 1.9s ease-in-out infinite;
+    }
+    .splash-name {
+      font-family: "Cormorant Garamond", Georgia, serif; font-size: 30px; color: #2b2620;
+      animation: splash-rise .7s ease both;
+    }
+    .splash-tagline {
+      margin-top: -12px; font-size: 10px; letter-spacing: 2.6px; text-transform: uppercase;
+      color: #a07d16; animation: splash-rise .7s .12s ease both;
+    }
+    .splash-dots { display: flex; gap: 7px; }
+    .splash-dots span {
+      width: 8px; height: 8px; border-radius: 50%; background: #c9a227;
+      animation: splash-bounce 1.2s ease-in-out infinite;
+    }
+    .splash-dots span:nth-child(2) { animation-delay: .16s; }
+    .splash-dots span:nth-child(3) { animation-delay: .32s; }
+    @keyframes splash-spin { to { transform: rotate(360deg); } }
+    @keyframes splash-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.07); } }
+    @keyframes splash-rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+    @keyframes splash-bounce { 0%, 100% { transform: translateY(0); opacity: .45; } 50% { transform: translateY(-7px); opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .splash-ring, .splash-logo, .splash-name, .splash-tagline, .splash-dots span { animation: none; }
+    }
+  </style>
 </head>
-<body><app-root></app-root></body>
+<body>
+  <div id="app-splash" role="status" aria-live="polite" aria-label="The Bathany is loading">
+    <div class="splash-mark">
+      <div class="splash-ring"></div>
+      <div class="splash-ring delayed"></div>
+      <img class="splash-logo" src="assets/brand/logo.jpeg" alt="">
+    </div>
+    <div class="splash-name">The Bathany</div>
+    <div class="splash-tagline">Botanical Bath Rituals</div>
+    <div class="splash-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+  </div>
+  <app-root></app-root>  <noscript>Please enable JavaScript to continue using this application.</noscript>
+  <script>
+    /*
+     * Records when the splash first actually painted on screen.
+     *
+     * On an installed PWA the OS shows its own icon launch screen and only reveals the page
+     * afterwards, so `performance.now()` (measured from navigation start) can already be well
+     * past the minimum hold by the time the user sees anything. Anchoring to the first frame
+     * rendered while the document is visible guarantees the loader is on screen for a real,
+     * perceivable duration in both the browser and the installed app.
+     */
+    (function () {
+      function mark() {
+        if (window.__splashShownAt) return;
+        requestAnimationFrame(function () {
+          requestAnimationFrame(function () { window.__splashShownAt = performance.now(); });
+        });
+      }
+      if (document.visibilityState === 'visible') mark();
+      else document.addEventListener('visibilitychange', function once() {
+        if (document.visibilityState !== 'visible') return;
+        document.removeEventListener('visibilitychange', once);
+        mark();
+      });
+    })();
+  </script>
+</body>
 </html>

@@ -1,7 +1,7 @@
 import { bootstrapApplication } from '@angular/platform-browser';
 import { provideHttpClient } from '@angular/common/http';
 import { ActivatedRoute, provideRouter, Router, RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
-import { Component, Injectable, LOCALE_ID, DEFAULT_CURRENCY_CODE, OnDestroy } from '@angular/core';
+import { Component, Injectable, LOCALE_ID, DEFAULT_CURRENCY_CODE, OnDestroy, NgZone, isDevMode } from '@angular/core';
 import { CommonModule, CurrencyPipe, DatePipe, UpperCasePipe, registerLocaleData } from '@angular/common';
 import localeIn from '@angular/common/locales/en-IN';
 import { FormsModule } from '@angular/forms';
@@ -9,6 +9,8 @@ import { HttpClient } from '@angular/common/http';
 import { Observable, of } from 'rxjs';
 import { catchError } from 'rxjs/operators';
 import { timeout } from 'rxjs/operators';
+import { provideServiceWorker } from '@angular/service-worker';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 
 registerLocaleData(localeIn);
 
@@ -53,8 +55,19 @@ export class Api {
   }
   checkout(body: unknown) { return this.http.post(`${this.base}/checkout`, body, { headers: this.authHeaders() }); }
   paymentMethods() { return this.http.get<any>(`${this.base}/payments/methods`).pipe(timeout(4000), catchError(() => of({ methods: [], testCards: [] }))); }
+  razorpayOrder(body: unknown) { return this.http.post<any>(`${this.base}/payments/razorpay/order`, body, { headers: this.authHeaders() }); }
+  paymentHistory() { return this.http.get<any[]>(`${this.base}/payments/history`, { headers: this.authHeaders() }); }
+  addresses() { return this.http.get<any[]>(`${this.base}/addresses`, { headers: this.authHeaders() }); }
+  createAddress(body: unknown) { return this.http.post<any>(`${this.base}/addresses`, body, { headers: this.authHeaders() }); }
+  updateAddress(id: number, body: unknown) { return this.http.put<any>(`${this.base}/addresses/${id}`, body, { headers: this.authHeaders() }); }
+  setDefaultAddress(id: number) { return this.http.post<any>(`${this.base}/addresses/${id}/default`, {}, { headers: this.authHeaders() }); }
+  deleteAddress(id: number) { return this.http.delete<any>(`${this.base}/addresses/${id}`, { headers: this.authHeaders() }); }
   orders() { return this.http.get<any[]>(`${this.base}/orders`, { headers: this.authHeaders() }); }
   admin(path: string) { return this.http.get<any>(`${this.base}/admin/${path}`, { headers: this.authHeaders() }); }
+  adminNotifications(afterId: number | null) {
+    const query = afterId === null ? '' : `?afterId=${afterId}`;
+    return this.http.get<{ latestId: number; items: any[] }>(`${this.base}/admin/notifications${query}`, { headers: this.authHeaders() });
+  }
   adminPost(path: string, body: unknown) { return this.http.post<any>(`${this.base}/admin/${path}`, body, { headers: this.authHeaders() }); }
   adminPut(path: string, body: unknown) { return this.http.put<any>(`${this.base}/admin/${path}`, body, { headers: this.authHeaders() }); }
   adminDelete(path: string) { return this.http.delete<any>(`${this.base}/admin/${path}`, { headers: this.authHeaders() }); }
@@ -105,6 +118,59 @@ export class Toast {
     this.message = message;
     clearTimeout(this.timer);
     this.timer = setTimeout(() => this.message = '', 2500);
+  }
+}
+
+/**
+ * Admin-only alert sound for new orders and customer activity.
+ *
+ * Browsers block audio until the user has interacted with the page, so the bell is unlocked on the
+ * admin's first click/keypress and silently skipped until then. The tone is synthesised with the
+ * Web Audio API rather than shipped as an asset, so it costs no download and no extra cache entry.
+ * The admin can mute it; the preference is stored per device.
+ */
+@Injectable({ providedIn: 'root' })
+export class AdminAlerts {
+  enabled = localStorage.getItem('admin-alerts') !== 'off';
+  private context: AudioContext | null = null;
+  private unlocked = false;
+
+  /** Must be called from a real user gesture before any sound can play. */
+  unlock() {
+    if (this.unlocked) return;
+    const Ctor = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      this.context = this.context || new Ctor();
+      this.context!.resume();
+      this.unlocked = true;
+    } catch { this.unlocked = false; }
+  }
+
+  setEnabled(on: boolean) {
+    this.enabled = on;
+    localStorage.setItem('admin-alerts', on ? 'on' : 'off');
+    if (on) { this.unlock(); this.ring(); }
+  }
+
+  /** Two-tone bell with an exponential decay, so it reads as a notification rather than a beep. */
+  ring() {
+    if (!this.enabled || !this.unlocked || !this.context) return;
+    const ctx = this.context;
+    if (ctx.state === 'suspended') ctx.resume();
+    [0, 0.18].forEach((offset, index) => {
+      const at = ctx.currentTime + offset;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(index === 0 ? 988 : 1319, at);
+      gain.gain.setValueAtTime(0.0001, at);
+      gain.gain.exponentialRampToValueAtTime(0.3, at + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.42);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(at);
+      osc.stop(at + 0.45);
+    });
   }
 }
 
@@ -185,13 +251,105 @@ export class Wishlist {
   constructor(public wishlist: WishlistStore, public cart: CartStore) {}
 }
 
+interface InstallPromptEvent extends Event {
+  prompt(): Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }>;
+}
+
+@Injectable({ providedIn: 'root' })
+export class AppInstall {
+  promptEvent: InstallPromptEvent | null = null;
+  installed = window.matchMedia('(display-mode: standalone)').matches ||
+    ('standalone' in navigator && navigator.standalone === true);
+
+  constructor() {
+    window.addEventListener('beforeinstallprompt', event => {
+      event.preventDefault();
+      this.promptEvent = event as InstallPromptEvent;
+    });
+    window.addEventListener('appinstalled', () => {
+      this.promptEvent = null;
+      this.installed = true;
+    });
+  }
+
+  async install(): Promise<string> {
+    if (!this.promptEvent) return 'Open Chrome’s menu and choose Install app or Add to Home screen.';
+    const prompt = this.promptEvent;
+    this.promptEvent = null;
+    await prompt.prompt();
+    const choice = await prompt.userChoice;
+    return choice.outcome === 'accepted' ? 'The Bathany is being added to your phone.' : 'Installation cancelled. You can try again from your browser menu.';
+  }
+}
+
+@Component({
+  standalone: true,
+  imports: [CommonModule, RouterLink],
+  template: `
+    <div class="page install-page">
+      <span class="eyebrow">The Bathany on your phone</span>
+      <h1>Take your bath rituals with you.</h1>
+      <p>Install our mobile web app directly from bathany.com. It opens from your home screen; no app store or download file is needed.</p>
+      <div class="install-tabs">
+        <a routerLink="/install/android" [class.active]="!ios">Android</a>
+        <a routerLink="/install/ios" [class.active]="ios">iPhone &amp; iPad</a>
+      </div>
+      <div class="install-card">
+        <img src="icons/icon-192x192.png" alt="The Bathany app icon" width="80" height="80">
+        <div *ngIf="installService.installed">
+          <h2>Already installed</h2>
+          <p>The Bathany is ready on this device. <a routerLink="/shop">Browse the collection</a>.</p>
+        </div>
+        <ng-container *ngIf="!installService.installed && !ios">
+          <h2>Install on Android</h2>
+          <button *ngIf="installService.promptEvent" class="btn-primary" type="button" (click)="installAndroid()">Install The Bathany</button>
+          <p *ngIf="message" role="status">{{ message }}</p>
+          <ol>
+            <li>Open <strong>bathany.com</strong> in Chrome on your Android phone.</li>
+            <li>Tap <strong>Install The Bathany</strong> above if available, or open Chrome's menu (⋮) and select <strong>Install app</strong> or <strong>Add to Home screen</strong>.</li>
+            <li>Confirm the installation, then open The Bathany from your home screen.</li>
+          </ol>
+        </ng-container>
+        <ng-container *ngIf="!installService.installed && ios">
+          <h2>Install on iPhone or iPad</h2>
+          <ol>
+            <li>Open <strong>bathany.com</strong> in Safari on your iPhone or iPad.</li>
+            <li>Tap Safari's <strong>Share</strong> button, then select <strong>Add to Home Screen</strong>. If it is not visible, scroll the Share menu.</li>
+            <li>Tap <strong>Add</strong>. The Bathany icon appears on your home screen.</li>
+          </ol>
+          <p>Apple does not offer an automatic install prompt in Safari. Use the steps above rather than an App Store link.</p>
+        </ng-container>
+      </div>
+      <p class="muted">An internet connection is required for product availability, sign-in and checkout. Payments are currently for testing only.</p>
+    </div>
+  `
+})
+export class InstallGuide {
+  ios = false;
+  message = '';
+  constructor(route: ActivatedRoute, public installService: AppInstall) {
+    route.paramMap.pipe(takeUntilDestroyed()).subscribe(params => {
+      this.ios = params.get('platform') === 'ios';
+      this.message = '';
+    });
+  }
+  async installAndroid() {
+    try {
+      this.message = await this.installService.install();
+    } catch {
+      this.message = 'Installation could not start. Open Chrome’s menu and select Install app or Add to Home screen.';
+    }
+  }
+}
+
 @Component({
   selector: 'app-root', standalone: true, imports: [CommonModule, RouterOutlet, RouterLink, RouterLinkActive],
   template: `
     <div class="topbar">
       <span>Handcrafted in India · Free shipping over ₹999</span>
       <span class="topbar-links">
-        <a routerLink="/rituals">Our Rituals</a><a routerLink="/ingredients">Ingredients</a><a routerLink="/care">Care</a>
+        <a routerLink="/rituals">Our Rituals</a><a routerLink="/ingredients">Ingredients</a><a routerLink="/care">Care</a><a routerLink="/about">About Us</a>
       </span>
       <span class="topbar-account">
         <ng-container *ngIf="!auth.isLoggedIn"><a routerLink="/login">Login</a><a routerLink="/register">Sign up</a></ng-container>
@@ -220,6 +378,7 @@ export class Wishlist {
       <a routerLink="/rituals" routerLinkActive="active">Our Rituals</a>
       <a routerLink="/ingredients" routerLinkActive="active">Ingredients</a>
       <a routerLink="/care" routerLinkActive="active">Care</a>
+      <a routerLink="/about" routerLinkActive="active">About Us</a>
       <a routerLink="/orders" routerLinkActive="active">My Orders</a>
       <a *ngIf="!auth.isLoggedIn" routerLink="/login" routerLinkActive="active">Login</a>
       <a *ngIf="!auth.isLoggedIn" routerLink="/register" routerLinkActive="active">Sign up</a>
@@ -232,14 +391,32 @@ export class Wishlist {
         <img class="footer-logo" src="assets/brand/logo.jpeg" alt="The Bathany">
         <div><strong>The Bathany</strong><span>Small-batch bath rituals, handcrafted in India.</span></div>
       </div>
-      <div class="footer-note"><span class="footer-links"><a routerLink="/rituals">Our Rituals</a><a routerLink="/ingredients">Ingredients</a><a routerLink="/care">Care</a></span><span>All natural · Cruelty free · Sulfate free · Paraben free</span><span>© {{ year }} The Bathany. Secure test checkout.</span></div>
+      <div class="footer-install">
+        <strong>Take The Bathany with you</strong>
+        <span>Install our mobile web app on your home screen.</span>
+        <div class="footer-install-actions">
+          <a routerLink="/install/android" aria-label="Install on Android" title="Install on Android">
+            <svg viewBox="0 0 32 32" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m9 4 2 3m12-3-2 3M6 15a10 10 0 0 1 20 0v8H6zM6 16H3v8m23-8h3v8M11 23v5m10-5v5"/>
+              <circle cx="12" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="20" cy="12" r="1" fill="currentColor" stroke="none"/>
+            </svg>
+          </a>
+          <a routerLink="/install/ios" aria-label="Install on iPhone" title="Install on iPhone">
+            <svg viewBox="0 0 32 32" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="8" y="2" width="16" height="28" rx="3"/>
+              <path d="M14 6h4m-3 20h2"/>
+            </svg>
+          </a>
+        </div>
+      </div>
+      <div class="footer-note"><span class="footer-links"><a routerLink="/rituals">Our Rituals</a><a routerLink="/ingredients">Ingredients</a><a routerLink="/care">Care</a><a routerLink="/about">About Us</a><a routerLink="/contact">Contact Us</a></span><span>All natural · Cruelty free · Sulfate free · Paraben free</span><span>© {{ year }} The Bathany. Secure test checkout.</span></div>
     </footer>
   `
 })
 export class App {
   year = new Date().getFullYear();
   menuOpen = false;
-  constructor(public cart: CartStore, public toast: Toast, public auth: Auth, public wishlist: WishlistStore, private router: Router) {}
+  constructor(public cart: CartStore, public toast: Toast, public auth: Auth, public wishlist: WishlistStore, public installService: AppInstall, private router: Router) {}
   logout(event?: Event) { event?.preventDefault(); this.auth.logout(); this.toast.show('You have been signed out'); this.router.navigateByUrl('/'); }
 }
 
@@ -314,35 +491,74 @@ export class Detail {
       <div class="summary"><div class="summary-line"><span>Subtotal</span><strong>{{ cart.total() | currency }}</strong></div><div class="summary-line"><span>Shipping</span><span>Free</span></div><hr><div class="summary-line"><strong>Total</strong><strong class="price">{{ cart.total() | currency }}</strong></div>
         <div class="ship-panel">
           <div class="pay-brand"><span class="ship-badge">Delivery</span><strong>Shipping address</strong></div>
-          <p class="muted pay-note">Where should we deliver this order?</p>
-          <div class="checkout-field"><label>Full name *</label><input [(ngModel)]="address.fullName" placeholder="Riya Sharma"></div>
-          <div class="checkout-field"><label>Phone *</label><input [(ngModel)]="address.phone" (ngModelChange)="formatPhone($event)" placeholder="9876543210" maxlength="10" inputmode="numeric"></div>
-          <div class="checkout-field"><label>Address line 1 *</label><input [(ngModel)]="address.line1" placeholder="Flat / House no., Building, Street"></div>
-          <div class="checkout-field"><label>Address line 2</label><input [(ngModel)]="address.line2" placeholder="Area, Colony (optional)"></div>
-          <div class="checkout-field"><label>Landmark</label><input [(ngModel)]="address.landmark" placeholder="Near… (optional)"></div>
-          <div class="pay-row">
-            <div class="checkout-field"><label>City *</label><input [(ngModel)]="address.city" placeholder="Pune"></div>
-            <div class="checkout-field"><label>State *</label>
-              <select [(ngModel)]="address.state">
-                <option value="">Select state</option>
-                <option *ngFor="let s of states" [value]="s">{{ s }}</option>
-              </select>
+
+          <div *ngIf="savedAddresses.length && !showAddressForm">
+            <p class="muted pay-note">Choose where we should deliver this order.</p>
+            <div class="address-list">
+              <button type="button" class="address-card" *ngFor="let a of savedAddresses"
+                      [class.selected]="selectedAddressId === a.id" (click)="selectAddress(a)">
+                <span class="address-card-head">
+                  <strong>{{ a.fullName }}</strong>
+                  <span class="address-default" *ngIf="a.isDefault">Default</span>
+                </span>
+                <span class="muted">{{ a.phone }}<br>
+                  {{ a.line1 }}<span *ngIf="a.line2">, {{ a.line2 }}</span><br>
+                  <span *ngIf="a.landmark">{{ a.landmark }}<br></span>
+                  {{ a.city }}, {{ a.state }} {{ a.postalCode }}</span>
+                <span class="address-card-actions">
+                  <span class="link-btn" *ngIf="!a.isDefault" (click)="makeDefault(a, $event)">Set as default</span>
+                  <span class="link-btn" (click)="editAddress(a, $event)">Edit</span>
+                  <span class="link-btn" (click)="removeAddress(a, $event)">Remove</span>
+                </span>
+              </button>
             </div>
+            <button type="button" class="btn-light add-address" (click)="newAddress()">+ Add new address</button>
           </div>
-          <div class="pay-row">
-            <div class="checkout-field"><label>PIN code *</label><input [(ngModel)]="address.postalCode" (ngModelChange)="formatPin($event)" placeholder="411001" maxlength="6" inputmode="numeric"></div>
-            <div class="checkout-field"><label>Country</label><input [(ngModel)]="address.country" readonly></div>
+
+          <div *ngIf="!savedAddresses.length || showAddressForm">
+            <p class="muted pay-note">{{ editingAddressId ? 'Update this address.' : 'Where should we deliver this order?' }}</p>
+            <div class="checkout-field"><label>Full name *</label><input [(ngModel)]="address.fullName" placeholder="Riya Sharma"></div>
+            <div class="checkout-field"><label>Phone *</label><input [(ngModel)]="address.phone" (ngModelChange)="formatPhone($event)" placeholder="9876543210" maxlength="10" inputmode="numeric"></div>
+            <div class="checkout-field"><label>Address line 1 *</label><input [(ngModel)]="address.line1" placeholder="Flat / House no., Building, Street"></div>
+            <div class="checkout-field"><label>Address line 2</label><input [(ngModel)]="address.line2" placeholder="Area, Colony (optional)"></div>
+            <div class="checkout-field"><label>Landmark</label><input [(ngModel)]="address.landmark" placeholder="Near… (optional)"></div>
+            <div class="pay-row">
+              <div class="checkout-field"><label>City *</label><input [(ngModel)]="address.city" placeholder="Pune"></div>
+              <div class="checkout-field"><label>State *</label>
+                <select [(ngModel)]="address.state">
+                  <option value="">Select state</option>
+                  <option *ngFor="let s of states" [value]="s">{{ s }}</option>
+                </select>
+              </div>
+            </div>
+            <div class="pay-row">
+              <div class="checkout-field"><label>PIN code *</label><input [(ngModel)]="address.postalCode" (ngModelChange)="formatPin($event)" placeholder="411001" maxlength="6" inputmode="numeric"></div>
+              <div class="checkout-field"><label>Country</label><input [(ngModel)]="address.country" readonly></div>
+            </div>
+            <label class="ship-save"><input type="checkbox" [(ngModel)]="makeAddressDefault"> Use this as my default address</label>
+            <div class="address-form-actions">
+              <button type="button" class="btn-primary" [disabled]="savingAddress" (click)="saveAddress()">{{ savingAddress ? 'Saving…' : (editingAddressId ? 'Update address' : 'Save address') }}</button>
+              <button type="button" class="btn-light" *ngIf="savedAddresses.length" (click)="cancelAddressForm()">Cancel</button>
+            </div>
+            <p class="pay-error" *ngIf="addressMessage">{{ addressMessage }}</p>
           </div>
-          <label class="ship-save"><input type="checkbox" [(ngModel)]="saveAddress"> Save this address for next time</label>
         </div>
         <div class="pay-panel">
-          <div class="pay-brand"><span class="pay-badge">Sandbox</span><strong>The Bathany Secure Pay</strong></div>
-          <p class="muted pay-note">No real money moves. Use a test card below to simulate results.</p>
+          <div class="pay-brand"><span class="pay-badge">{{ razorpayEnabled ? 'Secure' : 'Sandbox' }}</span><strong>{{ razorpayEnabled ? 'Razorpay Secure Checkout' : 'The Bathany Secure Pay' }}</strong></div>
+          <p class="muted pay-note" *ngIf="!razorpayEnabled">No real money moves. Use a test card below to simulate results.</p>
 
-          <div class="pay-methods">
+          <div class="pay-methods" *ngIf="methods.length > 1">
             <button type="button" class="pay-method" *ngFor="let m of methods" [class.selected]="method === m.code" (click)="method = m.code">
               <strong>{{ m.label }}</strong><span class="muted">{{ m.description }}</span>
             </button>
+          </div>
+
+          <div *ngIf="isRazorpay()" class="pay-online">
+            <p class="muted pay-note">You'll be taken to Razorpay's secure window to pay by UPI, card, netbanking or wallet.</p>
+            <details class="pay-testcards">
+              <summary>Test payment details</summary>
+              <p class="muted">Razorpay test mode — no real money moves. Use UPI id <strong>success&#64;razorpay</strong>, or card <strong>4111 1111 1111 1111</strong> with any future expiry and any CVV.</p>
+            </details>
           </div>
 
           <div *ngIf="requiresCard()">
@@ -368,8 +584,8 @@ export class Detail {
     <div class="modal-backdrop" *ngIf="confirmed" (click)="close()">
       <div class="order-modal" (click)="$event.stopPropagation()">
         <img class="modal-crest" src="assets/brand/logo.jpeg" alt="The Bathany">
-        <div class="order-modal-check">✓</div>
-        <h2>Thank you for your order!</h2>
+        <div class="order-modal-check success-pop">✓</div>
+        <h2>Congratulations — your payment was successful!</h2>
         <p class="muted">Order <strong>#{{ confirmed.id }}</strong> is confirmed and payment was {{ confirmed.payment?.status || confirmed.status }}.</p>
         <p class="muted pay-receipt" *ngIf="confirmed.payment">
           {{ confirmed.payment.cardLast4 ? confirmed.payment.cardBrand + ' •••• ' + confirmed.payment.cardLast4 : (confirmed.payment.method | uppercase) }}
@@ -389,29 +605,155 @@ export class Detail {
             {{ confirmed.shippingAddress.city }}, {{ confirmed.shippingAddress.state }} {{ confirmed.shippingAddress.postalCode }}<br>
             {{ confirmed.shippingAddress.country }}</p>
         </div>
-        <div class="order-modal-actions"><a class="btn-primary" routerLink="/orders" (click)="close()">View my orders</a><button class="btn-light" (click)="close()">Continue shopping</button></div>
+        <p class="redirect-note" *ngIf="redirectIn > 0" role="status">Taking you to your orders in {{ redirectIn }}s… <button type="button" class="link-btn" (click)="stayHere()">Stay here</button></p>
+        <div class="order-modal-actions"><button class="btn-primary" (click)="goToOrders()">View my orders</button><button class="btn-light" (click)="close()">Continue shopping</button></div>
       </div>
     </div>
   `
 })
-export class Cart {
+export class Cart implements OnDestroy {
   paymentToken = 'test_approved'; message = ''; placing = false; confirmed: any = null;
+  redirectIn = 0;
+  private redirectTimer: any = null;
   method = 'card';
   card = { number: '', holderName: '', expiry: '', cvv: '' };
   address = { fullName: '', phone: '', line1: '', line2: '', landmark: '', city: '', state: '', postalCode: '', country: 'India' };
-  saveAddress = true;
+  savedAddresses: any[] = [];
+  selectedAddressId: number | null = null;
+  editingAddressId: number | null = null;
+  showAddressForm = false;
+  makeAddressDefault = false;
+  savingAddress = false;
+  addressMessage = '';
   states = ['Andhra Pradesh','Arunachal Pradesh','Assam','Bihar','Chhattisgarh','Delhi','Goa','Gujarat','Haryana','Himachal Pradesh','Jammu & Kashmir','Jharkhand','Karnataka','Kerala','Madhya Pradesh','Maharashtra','Manipur','Meghalaya','Mizoram','Nagaland','Odisha','Puducherry','Punjab','Rajasthan','Sikkim','Tamil Nadu','Telangana','Tripura','Uttar Pradesh','Uttarakhand','West Bengal'];
   methods: any[] = [];
   testCards: any[] = [];
-  constructor(public cart: CartStore, private api: Api, private auth: Auth, private router: Router) {
-    const saved = localStorage.getItem('shipping-address');
-    if (saved) { try { this.address = { ...this.address, ...JSON.parse(saved) }; } catch { /* ignore malformed cache */ } }
+  razorpayEnabled = false;
+  private razorpayKeyId = '';
+  private static sdk: Promise<boolean> | null = null;
+  constructor(public cart: CartStore, private api: Api, private auth: Auth, private router: Router, private zone: NgZone) {
+    this.loadAddresses();
     this.api.paymentMethods().subscribe(res => {
       this.methods = res?.methods?.length ? res.methods : [{ code: 'card', label: 'Credit / Debit Card', description: 'Pay securely with a test card.', requiresCard: true }];
       this.testCards = res?.testCards || [];
+      this.razorpayEnabled = !!res?.razorpayEnabled;
+      this.razorpayKeyId = res?.razorpayKeyId || '';
+      // Default to online payment when it is available, since that is the real gateway.
+      if (this.razorpayEnabled && this.methods.some(m => m.code === 'razorpay')) this.method = 'razorpay';
+      if (this.razorpayEnabled) Cart.loadRazorpay();
     });
   }
+  isRazorpay() { return this.method === 'razorpay'; }
   requiresCard() { return this.methods.find(m => m.code === this.method)?.requiresCard ?? this.method === 'card'; }
+
+  /** Pulls the shopper's address book and preselects their default. */
+  private loadAddresses(selectId: number | null = null) {
+    if (!this.auth.isLoggedIn) return;
+    this.api.addresses().subscribe({
+      next: rows => {
+        this.savedAddresses = rows || [];
+        const pick = this.savedAddresses.find(a => a.id === selectId)
+          ?? this.savedAddresses.find(a => a.id === this.selectedAddressId)
+          ?? this.savedAddresses.find(a => a.isDefault)
+          ?? this.savedAddresses[0];
+        if (pick) { this.selectAddress(pick); this.showAddressForm = false; }
+        else { this.showAddressForm = true; this.selectedAddressId = null; }
+      },
+      // An unreachable address book should still allow a one-off address to be typed in.
+      error: () => { this.savedAddresses = []; this.showAddressForm = true; }
+    });
+  }
+
+  selectAddress(a: any) {
+    this.selectedAddressId = a.id;
+    this.address = {
+      fullName: a.fullName, phone: a.phone, line1: a.line1, line2: a.line2 || '',
+      landmark: a.landmark || '', city: a.city, state: a.state, postalCode: a.postalCode, country: a.country || 'India'
+    };
+    this.message = '';
+  }
+
+  newAddress() {
+    this.editingAddressId = null;
+    this.showAddressForm = true;
+    this.addressMessage = '';
+    this.makeAddressDefault = this.savedAddresses.length === 0;
+    this.address = { fullName: '', phone: '', line1: '', line2: '', landmark: '', city: '', state: '', postalCode: '', country: 'India' };
+  }
+
+  editAddress(a: any, event: Event) {
+    event.stopPropagation();
+    this.selectAddress(a);
+    this.editingAddressId = a.id;
+    this.makeAddressDefault = !!a.isDefault;
+    this.addressMessage = '';
+    this.showAddressForm = true;
+  }
+
+  cancelAddressForm() {
+    this.showAddressForm = false;
+    this.editingAddressId = null;
+    this.addressMessage = '';
+    const current = this.savedAddresses.find(a => a.id === this.selectedAddressId) ?? this.savedAddresses[0];
+    if (current) this.selectAddress(current);
+  }
+
+  saveAddress() {
+    const error = this.validateAddress();
+    if (error) { this.addressMessage = error; return; }
+    this.savingAddress = true; this.addressMessage = '';
+    const body = { ...this.address, isDefault: this.makeAddressDefault };
+    const request = this.editingAddressId
+      ? this.api.updateAddress(this.editingAddressId, body)
+      : this.api.createAddress(body);
+    request.subscribe({
+      next: saved => {
+        this.savingAddress = false;
+        this.editingAddressId = null;
+        this.showAddressForm = false;
+        this.loadAddresses(saved?.id ?? null);
+      },
+      error: err => {
+        this.savingAddress = false;
+        this.addressMessage = err.error?.detail || 'Could not save this address. Please try again.';
+      }
+    });
+  }
+
+  makeDefault(a: any, event: Event) {
+    event.stopPropagation();
+    this.api.setDefaultAddress(a.id).subscribe({
+      next: () => this.loadAddresses(a.id),
+      error: () => this.addressMessage = 'Could not update your default address.'
+    });
+  }
+
+  removeAddress(a: any, event: Event) {
+    event.stopPropagation();
+    if (!confirm(`Remove the address for ${a.fullName}?`)) return;
+    this.api.deleteAddress(a.id).subscribe({
+      next: () => {
+        if (this.selectedAddressId === a.id) this.selectedAddressId = null;
+        this.loadAddresses();
+      },
+      error: () => this.addressMessage = 'Could not remove this address.'
+    });
+  }
+
+  /** Loads Razorpay's widget once and reuses the same promise for later attempts. */
+  private static loadRazorpay(): Promise<boolean> {
+    if (Cart.sdk) return Cart.sdk;
+    Cart.sdk = new Promise<boolean>(resolve => {
+      if ((window as any).Razorpay) { resolve(true); return; }
+      const script = document.createElement('script');
+      script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+      script.async = true;
+      script.onload = () => resolve(true);
+      script.onerror = () => { Cart.sdk = null; resolve(false); };
+      document.head.appendChild(script);
+    });
+    return Cart.sdk;
+  }
   formatCard(value: string) {
     const digits = (value || '').replace(/\D/g, '').slice(0, 19);
     this.card.number = digits.replace(/(.{4})/g, '$1 ').trim();
@@ -422,7 +764,22 @@ export class Cart {
     this.card.expiry = '12/2030';
     this.card.cvv = '123';
   }
-  close() { this.confirmed = null; }
+  close() { this.clearRedirect(); this.confirmed = null; }
+
+  /** Holds the confirmation on screen briefly, then takes the shopper to their orders. */
+  private startRedirect() {
+    this.clearRedirect();
+    this.redirectIn = 3;
+    this.redirectTimer = setInterval(() => {
+      this.redirectIn -= 1;
+      if (this.redirectIn <= 0) { this.clearRedirect(); this.confirmed = null; this.router.navigate(['/orders']); }
+    }, 1000);
+  }
+  private clearRedirect() { if (this.redirectTimer) { clearInterval(this.redirectTimer); this.redirectTimer = null; } }
+  /** Lets the shopper stay on the confirmation instead of being moved on. */
+  stayHere() { this.clearRedirect(); this.redirectIn = 0; }
+  goToOrders() { this.clearRedirect(); this.confirmed = null; this.router.navigate(['/orders']); }
+  ngOnDestroy() { this.clearRedirect(); }
   formatPhone(value: string) { this.address.phone = (value || '').replace(/\D/g, '').slice(0, 10); }
   formatPin(value: string) { this.address.postalCode = (value || '').replace(/\D/g, '').slice(0, 6); }
 
@@ -440,15 +797,80 @@ export class Cart {
 
   checkout() {
     if (!this.auth.isLoggedIn) { this.router.navigate(['/login'], { queryParams: { returnUrl: '/cart' } }); return; }
+    if (this.showAddressForm && this.savedAddresses.length) { this.message = 'Please save or cancel the address you are editing first.'; return; }
     const addressError = this.validateAddress();
     if (addressError) { this.message = addressError; return; }
+    // A first-time shopper typed straight into the form; keep the address for next time.
+    if (this.showAddressForm && !this.savedAddresses.length) {
+      this.api.createAddress({ ...this.address, isDefault: true }).subscribe({ next: () => this.loadAddresses(), error: () => { /* checkout continues regardless */ } });
+    }
+    if (this.isRazorpay()) { this.payWithRazorpay(); return; }
+    this.placeOrder({});
+  }
+
+  /** Opens a Razorpay order on the server, shows the widget, then has the server verify the result. */
+  private async payWithRazorpay() {
+    this.placing = true; this.message = '';
+    const loaded = await Cart.loadRazorpay();
+    if (!loaded) { this.placing = false; this.message = 'Could not load the payment window. Check your connection and try again.'; return; }
+
+    const items = this.cart.lines.map(line => ({ productId: line.product.id, quantity: line.quantity }));
+    this.api.razorpayOrder({ items }).subscribe({
+      next: (session: any) => {
+        const options: any = {
+          key: session.keyId || this.razorpayKeyId,
+          amount: session.amount,
+          currency: session.currency,
+          name: 'The Bathany',
+          description: 'Botanical bath rituals',
+          image: 'assets/brand/logo.jpeg',
+          order_id: session.orderId,
+          prefill: { name: this.address.fullName || session.customer?.name || '', email: session.customer?.email || '', contact: this.address.phone || '' },
+          notes: { address: `${this.address.city}, ${this.address.state}` },
+          theme: { color: '#7a5c48' },
+          // The browser only relays these values; the server re-verifies every one of them.
+          // Razorpay calls these from outside Angular, so re-enter the zone or the UI never updates.
+          handler: (response: any) => this.zone.run(() => this.placeOrder({
+            razorpay: {
+              orderId: response.razorpay_order_id,
+              paymentId: response.razorpay_payment_id,
+              signature: response.razorpay_signature
+            }
+          })),
+          modal: {
+            ondismiss: () => this.zone.run(() => { if (this.confirmed) return; this.placing = false; this.message = 'Payment was cancelled. Your cart is unchanged.'; })
+          }
+        };
+        try {
+          const rzp = new (window as any).Razorpay(options);
+          rzp.on('payment.failed', (event: any) => this.zone.run(() => {
+            this.placing = false;
+            this.message = event?.error?.description || 'The payment failed. Please try another method.';
+          }));
+          rzp.open();
+        } catch {
+          this.placing = false;
+          this.message = 'Could not open the payment window. Please try again.';
+        }
+      },
+      error: error => {
+        this.placing = false;
+        if (error.status === 401) { this.auth.logout(); this.router.navigate(['/login'], { queryParams: { returnUrl: '/cart' } }); return; }
+        this.message = error.error?.detail || 'Could not start the payment. Please try again.';
+      }
+    });
+  }
+
+  /** Sends the order to the server; `extra` carries the Razorpay confirmation when there is one. */
+  private placeOrder(extra: Record<string, unknown>) {
     const idempotencyKey = crypto.randomUUID();
     this.placing = true; this.message = '';
     const body: any = {
       items: this.cart.lines.map(line => ({ productId: line.product.id, quantity: line.quantity })),
       paymentMethod: this.method,
       shippingAddress: { ...this.address },
-      idempotencyKey
+      idempotencyKey,
+      ...extra
     };
     if (this.requiresCard()) body.card = { ...this.card, number: this.card.number.replace(/\s/g, '') };
     this.api.checkout(body)
@@ -457,9 +879,8 @@ export class Cart {
           this.placing = false;
           if (order?.status === 'PaymentFailed') { this.message = order?.payment?.failureReason || 'Payment was declined. Please try another card.'; return; }
           this.confirmed = order; this.cart.lines = []; this.cart.save();
-          if (this.saveAddress) localStorage.setItem('shipping-address', JSON.stringify(this.address));
-          else localStorage.removeItem('shipping-address');
           this.card = { number: '', holderName: '', expiry: '', cvv: '' };
+          this.startRedirect();
         },
         error: error => { this.placing = false; this.message = error.status === 401 ? 'Your session expired. Please sign in again.' : error.error?.detail || 'Payment could not be completed. Please try again.'; if (error.status === 401) { this.auth.logout(); this.router.navigate(['/login'], { queryParams: { returnUrl: '/cart' } }); } }
       });
@@ -583,7 +1004,7 @@ export class Register {
 
 @Component({
   standalone: true, imports: [CommonModule, CurrencyPipe, DatePipe, RouterLink],
-  template: `<div class="page"><div class="section-heading"><h1>My orders</h1><a routerLink="/shop" class="muted">Continue shopping →</a></div>
+  template: `<div class="page"><div class="section-heading"><h1>My orders</h1><span class="order-head-links"><a routerLink="/payments" class="muted">Payment history</a><a routerLink="/shop" class="muted">Continue shopping →</a></span></div>
     <p *ngIf="error">{{ error }}</p>
     <p *ngIf="!error && !orders.length" class="muted">You have not placed any orders yet.</p>
     <article class="order-card" *ngFor="let order of orders">
@@ -619,15 +1040,64 @@ export class Register {
 export class Orders { orders: any[] = []; error = ''; constructor(api: Api) { api.orders().subscribe({ next: orders => this.orders = orders, error: () => this.error = 'Please sign in to view orders.' }); } }
 
 @Component({
+  standalone: true, imports: [CommonModule, CurrencyPipe, DatePipe, RouterLink],
+  template: `<div class="page"><div class="section-heading"><h1>Payment history</h1><a routerLink="/orders" class="muted">My orders →</a></div>
+    <p *ngIf="error">{{ error }}</p>
+    <p *ngIf="!error && loaded && !payments.length" class="muted">You have not made any payments yet.</p>
+    <div class="pay-summary" *ngIf="payments.length">
+      <div class="pay-stat"><span class="muted">Payments</span><strong>{{ payments.length }}</strong></div>
+      <div class="pay-stat"><span class="muted">Total paid</span><strong class="price">{{ totalPaid() | currency }}</strong></div>
+    </div>
+    <div class="table-scroll" *ngIf="payments.length">
+      <table class="data-table">
+        <thead><tr><th>Date</th><th>Order</th><th>Method</th><th>Reference</th><th>Status</th><th>Amount</th></tr></thead>
+        <tbody>
+          <tr *ngFor="let p of payments">
+            <td>{{ p.processedAt | date:'medium' }}</td>
+            <td><a routerLink="/orders">#{{ p.orderId }}</a></td>
+            <td>{{ label(p) }}<br><span class="muted" *ngIf="p.cardLast4">{{ p.cardBrand }} •••• {{ p.cardLast4 }}</span></td>
+            <td><span class="muted pay-ref">{{ p.providerPaymentId || p.transactionId }}</span></td>
+            <td><span class="pill" [class.pill-ok]="isPaid(p)" [class.pill-bad]="isFailed(p)">{{ p.status }}</span>
+              <br><span class="muted" *ngIf="p.failureReason">{{ p.failureReason }}</span></td>
+            <td><strong>{{ p.amount | currency }}</strong>
+              <br><span class="muted" *ngIf="p.refundedAmount > 0">Refunded {{ p.refundedAmount | currency }}</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>`
+})
+export class Payments {
+  payments: any[] = []; error = ''; loaded = false;
+  constructor(api: Api) {
+    api.paymentHistory().subscribe({
+      next: rows => { this.payments = rows || []; this.loaded = true; },
+      error: () => { this.error = 'Please sign in to view your payment history.'; this.loaded = true; }
+    });
+  }
+  isPaid(p: any) { return p.status === 'Approved' || p.status === 'Captured'; }
+  isFailed(p: any) { return p.status === 'Declined' || p.status === 'Failed'; }
+  label(p: any) { return p.provider === 'razorpay' ? 'Razorpay · ' + (p.method || 'online') : (p.method === 'cod' ? 'Cash on delivery' : p.method); }
+  totalPaid() { return this.payments.filter(p => this.isPaid(p)).reduce((sum, p) => sum + p.amount - (p.refundedAmount || 0), 0); }
+}
+
+@Component({
   standalone: true, imports: [CommonModule, FormsModule, DatePipe, CurrencyPipe],
   template: `<div class="page admin">
     <div class="section-heading">
       <div class="admin-title"><img class="admin-crest" src="assets/brand/logo.jpeg" alt="The Bathany"><div><div class="eyebrow">The Bathany</div><h1>Admin console</h1></div></div>
       <div class="admin-toolbar">
         <span class="muted" *ngIf="lastLoaded">Updated {{ lastLoaded | date:'shortTime' }}</span>
+        <button class="btn-light bell-toggle" [class.muted-bell]="!alerts.enabled"
+                (click)="alerts.setEnabled(!alerts.enabled)"
+                [attr.aria-pressed]="alerts.enabled"
+                [title]="alerts.enabled ? 'Notification sound is on — click to mute' : 'Notification sound is muted — click to unmute'">
+          {{ alerts.enabled ? '🔔' : '🔕' }} <span class="bell-label">{{ alerts.enabled ? 'Alerts on' : 'Alerts muted' }}</span>
+        </button>
         <button class="btn-light" (click)="load()">Refresh</button>
       </div>
     </div>
+    <p class="admin-alert" *ngIf="latestAlert" role="status" aria-live="polite">🔔 {{ latestAlert }}</p>
     <p class="pay-error" *ngIf="error">{{ error }}</p>
     <p class="admin-flash" *ngIf="message">{{ message }}</p>
 
@@ -671,7 +1141,7 @@ export class Orders { orders: any[] = []; error = ''; constructor(api: Api) { ap
           <label>Category<select [(ngModel)]="editing.categoryId" name="categoryId">
             <option *ngFor="let c of config.categories" [ngValue]="c.id">{{ c.name }}</option>
           </select></label>
-          <label>Image URL<input [(ngModel)]="editing.imageUrl" name="imageUrl" placeholder="/img/product-1.jpg"></label>
+          <label>Image URL<input [(ngModel)]="editing.imageUrl" name="imageUrl" placeholder="Upload an image with Browse…"></label>
           <label class="check">Active<input type="checkbox" [(ngModel)]="editing.isActive" name="isActive"></label>
         </div>
         <div class="upload-row">
@@ -684,8 +1154,8 @@ export class Orders { orders: any[] = []; error = ''; constructor(api: Api) { ap
         </div>
         <label>Description<textarea [(ngModel)]="editing.description" name="description" rows="2"></textarea></label>
         <div class="form-actions">
-          <button class="btn-primary" type="submit" [disabled]="saving">{{ saving ? 'Saving…' : 'Save product' }}</button>
-          <button class="link-btn" type="button" (click)="editing = null">Cancel</button>
+          <button class="btn-primary" type="submit" [disabled]="saving || uploading">{{ uploading ? 'Uploading image…' : saving ? 'Saving…' : 'Save product' }}</button>
+          <button class="link-btn" type="button" [disabled]="uploading" (click)="editing = null">Cancel</button>
         </div>
       </form>
 
@@ -738,6 +1208,46 @@ export class Orders { orders: any[] = []; error = ''; constructor(api: Api) { ap
         </tbody></table>
     </section>
 
+    <!-- Payments -->
+    <section *ngIf="section === 'payments'">
+      <div class="admin-subhead">
+        <h2>Payments</h2>
+        <div class="pay-filters">
+          <input [(ngModel)]="paymentSearch" (keyup.enter)="loadPayments()" placeholder="Reference, customer or order #">
+          <select [(ngModel)]="paymentStatus" (ngModelChange)="loadPayments()">
+            <option value="">All statuses</option>
+            <option *ngFor="let s of paymentData.statuses" [value]="s">{{ s }}</option>
+          </select>
+          <select [(ngModel)]="paymentProvider" (ngModelChange)="loadPayments()">
+            <option value="">All providers</option>
+            <option *ngFor="let p of paymentData.providers" [value]="p">{{ p }}</option>
+          </select>
+          <button class="btn-light" (click)="loadPayments()">Search</button>
+        </div>
+      </div>
+      <div class="admin-cards">
+        <div class="admin-card"><strong>{{ paymentData.summary.capturedAmount || 0 | currency }}</strong>Captured</div>
+        <div class="admin-card"><strong>{{ paymentData.summary.captured || 0 }}</strong>Successful</div>
+        <div class="admin-card"><strong>{{ paymentData.summary.failed || 0 }}</strong>Failed</div>
+        <div class="admin-card"><strong>{{ paymentData.summary.pending || 0 }}</strong>Pending</div>
+        <div class="admin-card"><strong>{{ paymentData.summary.online || 0 }}</strong>Razorpay</div>
+      </div>
+      <table class="data-table"><thead><tr><th>#</th><th>Order</th><th>Customer</th><th>Method</th><th>Reference</th><th>Status</th><th>Amount</th><th>When</th></tr></thead>
+        <tbody>
+          <tr *ngFor="let p of paymentData.items">
+            <td>{{ p.id }}</td>
+            <td>#{{ p.orderId }}<br><span class="muted">{{ p.orderStatus }}</span></td>
+            <td>{{ p.customer }}<br><span class="muted">{{ p.customerName }}</span></td>
+            <td>{{ p.provider === 'razorpay' ? 'Razorpay' : 'Simulated' }}<br><span class="muted">{{ p.method }}<span *ngIf="p.cardLast4"> · {{ p.cardBrand }} •••• {{ p.cardLast4 }}</span></span></td>
+            <td><span class="muted pay-ref">{{ p.providerPaymentId || p.transactionId }}</span></td>
+            <td><span class="pill" [attr.data-status]="p.status">{{ p.status }}</span><br><span class="muted" *ngIf="p.failureReason">{{ p.failureReason }}</span></td>
+            <td>{{ p.amount | currency }}<br><span class="muted" *ngIf="p.refundedAmount > 0">−{{ p.refundedAmount | currency }}</span></td>
+            <td>{{ p.processedAt | date:'medium' }}</td>
+          </tr>
+          <tr *ngIf="!paymentData.items.length"><td colspan="8" class="muted">No payments match this filter.</td></tr>
+        </tbody></table>
+    </section>
+
     <!-- Users -->
     <section *ngIf="section === 'users'">
       <h2>Users</h2>
@@ -775,7 +1285,7 @@ export class Orders { orders: any[] = []; error = ''; constructor(api: Api) { ap
     </section>
   </div>`
 })
-export class Admin {
+export class Admin implements OnDestroy {
   img = imageSrc;
   /** Defaults are replaced by GET /api/admin/config so sections, statuses and roles stay server-driven. */
   config: any = {
@@ -787,6 +1297,7 @@ export class Admin {
       { key: 'dashboard', label: 'Dashboard', icon: '\u25a4' },
       { key: 'products', label: 'Products', icon: '\u25a6' },
       { key: 'orders', label: 'Orders', icon: '\ud83e\uddfe' },
+      { key: 'payments', label: 'Payments', icon: '\ud83d\udcb3' },
       { key: 'users', label: 'Users', icon: '\ud83d\udc65' },
       { key: 'activity', label: 'Activity', icon: '\ud83d\udd52' }
     ]
@@ -794,12 +1305,58 @@ export class Admin {
   section = 'dashboard';
   stats: any = {};
   products: any[] = []; orders: any[] = []; users: any[] = []; activity: any[] = [];
+  paymentData: any = { summary: {}, items: [], providers: [], statuses: [] };
+  paymentSearch = ''; paymentStatus = ''; paymentProvider = '';
   editing: any = null;
   resetFor: number | null = null; newPassword = '';
   saving = false; uploading = false; message = ''; error = ''; lastLoaded: Date | null = null;
+  latestAlert = '';
+  /** null means "no baseline yet" — the first poll only records the cursor so old rows never ring. */
+  private lastSeenActivityId: number | null = null;
+  private pollTimer: ReturnType<typeof setInterval> | undefined;
+  private alertTimer: ReturnType<typeof setTimeout> | undefined;
+  private unlockAlerts = () => this.alerts.unlock();
 
-  constructor(private api: Api) {
+  constructor(private api: Api, public alerts: AdminAlerts) {
     this.load();
+    // Audio needs a user gesture; the admin's first interaction anywhere on the console unlocks it.
+    window.addEventListener('pointerdown', this.unlockAlerts);
+    window.addEventListener('keydown', this.unlockAlerts);
+    this.api.adminNotifications(null).subscribe({
+      next: res => {
+        this.lastSeenActivityId = res.latestId;
+        this.pollTimer = setInterval(() => this.pollNotifications(), 20000);
+      },
+      error: () => {}
+    });
+  }
+
+  ngOnDestroy() {
+    clearInterval(this.pollTimer);
+    clearTimeout(this.alertTimer);
+    window.removeEventListener('pointerdown', this.unlockAlerts);
+    window.removeEventListener('keydown', this.unlockAlerts);
+  }
+
+  /** Rings once per batch, not once per row, so a burst of activity is not a burst of chimes. */
+  private pollNotifications() {
+    if (this.lastSeenActivityId === null) return;
+    this.api.adminNotifications(this.lastSeenActivityId).subscribe({
+      next: res => {
+        this.lastSeenActivityId = res.latestId;
+        if (!res.items?.length) return;
+        const order = res.items.find(a => a.action === 'Checkout');
+        const headline = order
+          ? `New order placed — ${order.details}`
+          : `${res.items.length} new customer ${res.items.length === 1 ? 'activity' : 'activities'} — ${res.items[res.items.length - 1].action}`;
+        this.latestAlert = headline;
+        clearTimeout(this.alertTimer);
+        this.alertTimer = setTimeout(() => this.latestAlert = '', 15000);
+        this.alerts.ring();
+        this.load();
+      },
+      error: () => {}
+    });
   }
 
   /** Config carries categories/statuses/roles, so it must be retried on every load — not once in the constructor. */
@@ -820,7 +1377,20 @@ export class Admin {
     this.api.admin('orders').subscribe({ next: d => this.orders = d, error: () => this.orders = [] });
     this.api.admin('users').subscribe({ next: d => this.users = d, error: () => this.users = [] });
     this.api.admin('activity').subscribe({ next: d => this.activity = d, error: () => this.activity = [] });
+    this.loadPayments();
     this.lastLoaded = new Date();
+  }
+
+  loadPayments() {
+    const params = new URLSearchParams();
+    if (this.paymentStatus) params.set('status', this.paymentStatus);
+    if (this.paymentProvider) params.set('provider', this.paymentProvider);
+    if (this.paymentSearch.trim()) params.set('search', this.paymentSearch.trim());
+    const query = params.toString();
+    this.api.admin(`payments${query ? '?' + query : ''}`).subscribe({
+      next: d => this.paymentData = { summary: d.summary || {}, items: d.items || [], providers: d.providers || [], statuses: d.statuses || [] },
+      error: () => this.paymentData = { summary: {}, items: [], providers: [], statuses: [] }
+    });
   }
 
   private flash(text: string) { this.message = text; this.error = ''; setTimeout(() => this.message = '', 4000); }
@@ -833,14 +1403,25 @@ export class Admin {
     const input = event.target as HTMLInputElement;
     const file = input.files?.[0];
     if (!file) return;
+    if (!this.editing || this.uploading) { this.error = 'Wait for the current upload to finish.'; input.value = ''; return; }
+    const editing = this.editing;
     this.uploading = true; this.error = '';
     this.api.uploadProductImage(file).subscribe({
-      next: res => { this.uploading = false; this.editing.imageUrl = res.url; this.flash('Image uploaded.'); input.value = ''; },
+      next: res => {
+        this.uploading = false;
+        if (this.editing === editing) { editing.imageUrl = res.url; this.flash('Image uploaded. Save the product to use it.'); }
+        else this.error = 'Image uploaded, but the product form changed. Reopen the product and select the image again.';
+        input.value = '';
+      },
       error: e => { this.uploading = false; input.value = ''; this.error = e?.error?.detail || 'Could not upload that image.'; }
     });
   }
 
   saveProduct() {
+    if (this.saving) return;
+    if (this.uploading) { this.error = 'Wait for the image upload to finish before saving.'; return; }
+    if (!this.editing.imageUrl?.trim()) { this.error = 'Upload an image before saving this product.'; return; }
+    this.error = '';
     const body = { name: this.editing.name, description: this.editing.description, price: Number(this.editing.price), stock: Number(this.editing.stock), imageUrl: this.editing.imageUrl, categoryId: Number(this.editing.categoryId), isActive: !!this.editing.isActive };
     this.saving = true;
     const done = (text: string) => { this.saving = false; this.editing = null; this.flash(text); this.load(); };
@@ -1043,5 +1624,188 @@ export class Care {
   ];
 }
 
-bootstrapApplication(App, { providers: [provideHttpClient(), { provide: LOCALE_ID, useValue: 'en-IN' }, { provide: DEFAULT_CURRENCY_CODE, useValue: 'INR' }, provideRouter([{ path: '', component: Shop }, { path: 'shop', component: Shop }, { path: 'detail/:id', component: Detail }, { path: 'rituals', component: Rituals }, { path: 'ingredients', component: Ingredients }, { path: 'care', component: Care }, { path: 'cart', component: Cart }, { path: 'wishlist', component: Wishlist }, { path: 'login', component: Login }, { path: 'register', component: Register }, { path: 'forgot-password', component: ForgotPassword }, { path: 'reset-password', component: ResetPassword }, { path: 'orders', component: Orders }, { path: 'admin', component: Admin }])] }).catch(console.error);
+@Component({
+  standalone: true, imports: [CommonModule, RouterLink],
+  template: `
+    <div class="page">
+      <section class="content-hero">
+        <div>
+          <div class="eyebrow">Our story</div>
+          <h1>About Us</h1>
+          <p>The Bathany began in a home kitchen with one stubborn idea: that a bath should feel like a ritual, not a chore. We still whip every batch by hand, in small quantities, in India.</p>
+        </div>
+        <img src="assets/brand/product-2.jpeg" alt="Chai Spice Soul Whipped Soap">
+      </section>
 
+      <section class="ritual-list">
+        <article class="ritual" *ngFor="let chapter of story; let i = index" [class.reverse]="i % 2 === 1">
+          <img [src]="chapter.image" [alt]="chapter.title">
+          <div>
+            <div class="eyebrow">{{ chapter.step }}</div>
+            <h3>{{ chapter.title }}</h3>
+            <p>{{ chapter.body }}</p>
+            <ul class="detail-points"><li *ngFor="let point of chapter.points">{{ point }}</li></ul>
+          </div>
+        </article>
+      </section>
+
+      <section class="promise">
+        <div><strong>All Natural</strong><span>Botanical oils &amp; butters</span></div>
+        <div><strong>Cruelty Free</strong><span>Never tested on animals</span></div>
+        <div><strong>Small Batch</strong><span>Whipped by hand, never mass produced</span></div>
+        <div><strong>Made in India</strong><span>Locally sourced, locally made</span></div>
+      </section>
+
+      <div class="section-heading"><h2>What we stand for</h2><span class="muted">The rules we don't bend</span></div>
+      <section class="care-grid">
+        <article class="care-card" *ngFor="let value of values">
+          <span class="care-num">{{ value.n }}</span>
+          <h3>{{ value.title }}</h3>
+          <p>{{ value.body }}</p>
+        </article>
+      </section>
+
+      <div class="section-heading"><h2>Questions about us</h2><span class="muted">The things people ask</span></div>
+      <section class="faq-list">
+        <details class="faq" *ngFor="let f of faqs">
+          <summary>{{ f.q }}</summary>
+          <p>{{ f.a }}</p>
+        </details>
+      </section>
+
+      <section class="cta-band">
+        <div><h2>Come soak with us</h2><p>Four rituals, whipped by hand and waiting.</p></div>
+        <a class="btn-primary" routerLink="/shop">Shop the collection</a>
+      </section>
+    </div>
+  `
+})
+export class About {
+  story = [
+    { step: 'The beginning', title: 'One jar, one kitchen', image: 'assets/brand/product-1.jpeg',
+      body: 'We started because we could not find a bath product we actually trusted. Everything on the shelf was either harsh, over-fragranced, or vague about what was inside. So we began whipping our own — one jar at a time, on a kitchen counter, until the texture was right.',
+      points: ['First batch made for friends and family', 'Reformulated more times than we care to admit', 'The rose blend became Potion No. 04'] },
+    { step: 'How we make it', title: 'Slow, small and by hand', image: 'assets/brand/product-3.jpeg',
+      body: 'Every batch is still whipped by hand in small quantities. It takes longer and it does not scale neatly, but it is the only way we can check the texture of every jar and keep our blends genuinely fresh rather than shelf-stable for years.',
+      points: ['Cold-pressed butters, never heat-stripped', 'Whole spices and petals, ground in-house', 'Each jar stamped with its batch date'] },
+    { step: 'Where we are going', title: 'Better, not bigger', image: 'assets/brand/product-4.jpeg',
+      body: 'We would rather deepen the collection than flood it. New blends only launch once they earn their place, and we will keep publishing our full ingredient list so you never have to take our word for it.',
+      points: ['Reusable glass jars and aluminium tins', 'Block-printed cotton pouches made to be kept', 'Botanicals sourced from Indian growers'] }
+  ];
+  values = [
+    { n: '01', title: 'Say what is inside', body: 'Every jar lists its full blend on the label, and our Ingredients page explains what each element does and why it is there. No proprietary mystery blends.' },
+    { n: '02', title: 'Gentle by default', body: 'Sulfate free, paraben free, and mild by design. If an ingredient only exists to make lather look more dramatic, it does not go in.' },
+    { n: '03', title: 'Never on animals', body: 'Nothing we make is tested on animals, at any stage, by us or anyone we work with. This is not negotiable.' },
+    { n: '04', title: 'Small batch, always', body: 'We cap our batch sizes so we can check texture and scent by hand. Selling out for a week is a fair price for getting it right.' }
+  ];
+  faqs = [
+    { q: 'Where is The Bathany made?', a: 'Everything is blended and whipped by hand in India, using botanicals sourced from Indian growers wherever the ingredient allows it.' },
+    { q: 'Are you really cruelty free?', a: 'Yes. No product or ingredient we use is tested on animals, at any stage, by us or by our suppliers.' },
+    { q: 'Why is the collection so small?', a: 'Because every blend has to earn its place. We would rather make four things properly than forty things adequately — and small batches let us keep quality consistent.' },
+    { q: 'Do you ship across India?', a: 'Yes, we ship nationwide, and shipping is free on orders over ₹999. Delivery and returns details are included with every order.' },
+    { q: 'How do I reach you?', a: 'Order-specific questions are best raised from your order in the My Orders page, so we can see exactly which batch and shipment you mean.' }
+  ];
+}
+
+@Component({
+  standalone: true, imports: [CommonModule, RouterLink],
+  template: `
+    <div class="page">
+      <section class="content-hero">
+        <div>
+          <div class="eyebrow">We're listening</div>
+          <h1>Contact Us</h1>
+          <p>Questions about a blend, an order, or which ritual to start with? Write to us and a real person will read it — usually within one working day.</p>
+        </div>
+        <img src="assets/brand/product-1.jpeg" alt="Potion No. 04">
+      </section>
+
+      <div class="section-heading"><h2>How to reach us</h2><span class="muted">Pick whichever suits</span></div>
+      <section class="care-grid">
+        <article class="care-card" *ngFor="let channel of channels">
+          <span class="care-num">{{ channel.n }}</span>
+          <h3>{{ channel.title }}</h3>
+          <p>{{ channel.body }}</p>
+          <p *ngIf="channel.email">
+            <a class="contact-link" [href]="'mailto:' + channel.email">{{ channel.email }}</a>
+          </p>
+          <p *ngIf="channel.link">
+            <a class="contact-link" [routerLink]="channel.link">{{ channel.linkLabel }}</a>
+          </p>
+        </article>
+      </section>
+
+      <div class="section-heading"><h2>Before you write</h2><span class="muted">These may answer it faster</span></div>
+      <section class="faq-list">
+        <details class="faq" *ngFor="let f of faqs">
+          <summary>{{ f.q }}</summary>
+          <p>{{ f.a }}</p>
+        </details>
+      </section>
+
+      <section class="cta-band">
+        <div><h2>Still have a question?</h2><p>Email us at {{ supportEmail }} and we'll take it from there.</p></div>
+        <a class="btn-primary" [href]="'mailto:' + supportEmail">Email us</a>
+      </section>
+    </div>
+  `
+})
+export class Contact {
+  supportEmail = 'support@bathany.com';
+  channels = [
+    { n: '01', title: 'Email us', body: 'The best way to reach us for anything — product questions, ingredient queries, wholesale or press. We aim to reply within one working day.', email: 'support@bathany.com', link: '', linkLabel: '' },
+    { n: '02', title: 'About an order', body: 'Open the order in your account first. Quoting the order number lets us check the exact batch and shipment straight away.', email: '', link: '/orders', linkLabel: 'View my orders' },
+    { n: '03', title: 'Ingredients and sensitivities', body: 'Every blend is listed in full on our Ingredients page. If you are checking against a known allergy, email us and we will confirm before you buy.', email: '', link: '/ingredients', linkLabel: 'See all ingredients' },
+    { n: '04', title: 'Caring for your jar', body: 'Texture changed, or not sure how long a jar lasts? Our care guide covers storage, shelf life and the most common surprises.', email: '', link: '/care', linkLabel: 'Read care guide' }
+  ];
+  faqs = [
+    { q: 'How quickly will I hear back?', a: 'We aim to reply to every email within one working day. Weekends and public holidays may add a little to that.' },
+    { q: 'Where do I find my order number?', a: 'It is shown against each order in the My Orders page, and repeated in your order confirmation. Quoting it helps us answer in one reply rather than three.' },
+    { q: 'Can I change or cancel an order?', a: 'Write to us as soon as you can. If the order has not yet been packed we can usually amend it; once it has shipped we will help you with a return instead.' },
+    { q: 'Do you take wholesale or stockist enquiries?', a: 'Yes. Email us with a little about your shop and we will send you our wholesale terms.' },
+    { q: 'My order arrived damaged — what now?', a: 'Email us a photo along with your order number. We will arrange a replacement or refund without asking you to post anything back.' }
+  ];
+}
+
+/** Minimum time the loader stays on screen once it is actually visible to the user. */
+const SPLASH_MIN_VISIBLE_MS = 1400;
+
+/**
+ * Removes the pre-Angular splash once the app has rendered, with a short fade.
+ *
+ * The hold is measured from when the splash first painted while the document was visible, not
+ * from navigation start. In an installed PWA the OS covers the page with its own icon screen
+ * during startup, so a navigation-start hold can elapse entirely behind that screen and the
+ * loader would never be seen.
+ */
+function dismissSplash() {
+  const splash = document.getElementById('app-splash');
+  if (!splash) return;
+
+  const hide = () => {
+    splash.classList.add('is-hidden');
+    setTimeout(() => splash.remove(), 600);
+  };
+
+  const waitForVisibleThenHide = () => {
+    const shownAt: number | undefined = (window as any).__splashShownAt;
+    if (shownAt === undefined) {
+      // The first visible frame hasn't been recorded yet; re-check on the next one.
+      requestAnimationFrame(waitForVisibleThenHide);
+      return;
+    }
+    setTimeout(hide, Math.max(0, SPLASH_MIN_VISIBLE_MS - (performance.now() - shownAt)));
+  };
+
+  if (document.visibilityState === 'visible') waitForVisibleThenHide();
+  else document.addEventListener('visibilitychange', function once() {
+    if (document.visibilityState !== 'visible') return;
+    document.removeEventListener('visibilitychange', once);
+    waitForVisibleThenHide();
+  });
+}
+
+bootstrapApplication(App, { providers: [provideHttpClient(), { provide: LOCALE_ID, useValue: 'en-IN' }, { provide: DEFAULT_CURRENCY_CODE, useValue: 'INR' }, provideRouter([{ path: '', component: Shop }, { path: 'shop', component: Shop }, { path: 'detail/:id', component: Detail }, { path: 'rituals', component: Rituals }, { path: 'ingredients', component: Ingredients }, { path: 'care', component: Care }, { path: 'about', component: About }, { path: 'contact', component: Contact }, { path: 'cart', component: Cart }, { path: 'wishlist', component: Wishlist }, { path: 'install/:platform', component: InstallGuide }, { path: 'login', component: Login }, { path: 'register', component: Register }, { path: 'forgot-password', component: ForgotPassword }, { path: 'reset-password', component: ResetPassword }, { path: 'orders', component: Orders }, { path: 'payments', component: Payments }, { path: 'admin', component: Admin }]), provideServiceWorker('ngsw-worker.js', {
+            enabled: !isDevMode(),
+            registrationStrategy: 'registerWhenStable:30000'
+          })] }).then(dismissSplash).catch(err => { dismissSplash(); console.error(err); });

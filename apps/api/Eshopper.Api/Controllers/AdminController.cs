@@ -14,7 +14,7 @@ public record UserRoleRequest(string? Role = null);
 
 [ApiController, Route("api/admin")]
 [Authorize(Policy = "AdminOnly")]
-public class AdminController(ShopDbContext db, IPasswordService passwords) : ControllerBase
+public class AdminController(ShopDbContext db, IPasswordService passwords, IEmailService email) : ControllerBase
 {
     private static readonly string[] OrderStatuses = ["Pending", "Paid", "Processing", "Shipped", "Delivered", "Cancelled", "Refunded", "PaymentFailed"];
     private static readonly string[] Roles = ["Customer", "Admin"];
@@ -37,6 +37,7 @@ public class AdminController(ShopDbContext db, IPasswordService passwords) : Con
             new { key = "dashboard", label = "Dashboard", icon = "\u25a4" },
             new { key = "products", label = "Products", icon = "\u25a6" },
             new { key = "orders", label = "Orders", icon = "\ud83e\uddfe" },
+            new { key = "payments", label = "Payments", icon = "\ud83d\udcb3" },
             new { key = "users", label = "Users", icon = "\ud83d\udc65" },
             new { key = "activity", label = "Activity", icon = "\ud83d\udd52" }
         }
@@ -114,10 +115,11 @@ public class AdminController(ShopDbContext db, IPasswordService passwords) : Con
     public async Task<IActionResult> Add(ProductRequest input)
     {
         if (Invalid(input) is { } error) return Problem(error, statusCode: 400);
+        if (string.IsNullOrWhiteSpace(input.ImageUrl)) return Problem("Upload an image before saving this product.", statusCode: 400);
         var product = new Product
         {
             Name = input.Name!.Trim(), Description = input.Description?.Trim() ?? "", Price = input.Price,
-            Stock = input.Stock, ImageUrl = string.IsNullOrWhiteSpace(input.ImageUrl) ? "/img/product-1.jpg" : input.ImageUrl.Trim(),
+            Stock = input.Stock, ImageUrl = input.ImageUrl.Trim(),
             CategoryId = input.CategoryId, IsActive = input.IsActive
         };
         db.Products.Add(product);
@@ -193,17 +195,77 @@ public class AdminController(ShopDbContext db, IPasswordService passwords) : Con
     {
         if (string.IsNullOrWhiteSpace(request.Status) || !OrderStatuses.Contains(request.Status))
             return Problem($"Status must be one of: {string.Join(", ", OrderStatuses)}.", statusCode: 400);
-        var order = await db.Orders.FindAsync(id);
+        var order = await db.Orders.Include(o => o.Items).Include(o => o.ShippingAddress).SingleOrDefaultAsync(o => o.Id == id);
         if (order is null) return NotFound();
         var previous = order.Status;
+        if (previous == request.Status) return Ok(new { order.Id, order.Status });
         order.Status = request.Status;
         Audit("OrderStatusChanged", $"Order #{id} moved from {previous} to {request.Status}");
         await db.SaveChangesAsync();
+
+        // Keep the shopper informed; a mail failure must not fail the status change.
+        var customerEmail = await db.Users.AsNoTracking().Where(u => u.Id == order.UserId).Select(u => u.Email).SingleOrDefaultAsync();
+        if (!string.IsNullOrWhiteSpace(customerEmail)) await email.SendOrderStatusAsync(order, customerEmail, previous);
         return Ok(new { order.Id, order.Status });
     }
 
-    [HttpGet("users")] public Task<List<object>> Users() => db.Users.AsNoTracking().OrderBy(u => u.Id)
-        .Select(u => (object)new { u.Id, u.Email, u.DisplayName, u.Role, u.CreatedAt }).ToListAsync();
+    /// <summary>
+    /// Full payment ledger for reconciliation against the Razorpay dashboard. Supports filtering by
+    /// status, provider and a free-text search across reference, customer and order number.
+    /// </summary>
+    [HttpGet("payments")]
+    public async Task<IActionResult> Payments([FromQuery] string? status = null, [FromQuery] string? provider = null, [FromQuery] string? search = null)
+    {
+        var query = from p in db.Payments.AsNoTracking()
+                    join o in db.Orders.AsNoTracking() on p.OrderId equals o.Id
+                    join u in db.Users.AsNoTracking() on o.UserId equals u.Id into gu
+                    from u in gu.DefaultIfEmpty()
+                    select new
+                    {
+                        p.Id, p.OrderId, p.Amount, p.Currency, p.Status, p.Method, p.Provider,
+                        p.CardBrand, p.CardLast4, p.TransactionId, p.ProviderOrderId, p.ProviderPaymentId,
+                        p.FailureReason, p.RefundedAmount, p.ProcessedAt,
+                        orderStatus = o.Status,
+                        userId = o.UserId,
+                        customer = u != null ? u.Email : "unknown",
+                        customerName = u != null ? u.DisplayName : ""
+                    };
+
+        if (!string.IsNullOrWhiteSpace(status)) query = query.Where(x => x.Status == status);
+        if (!string.IsNullOrWhiteSpace(provider)) query = query.Where(x => x.Provider == provider);
+        if (!string.IsNullOrWhiteSpace(search))
+        {
+            var term = search.Trim();
+            query = query.Where(x =>
+                x.TransactionId.Contains(term) ||
+                x.ProviderPaymentId.Contains(term) ||
+                x.ProviderOrderId.Contains(term) ||
+                x.customer.Contains(term) ||
+                x.OrderId.ToString() == term);
+        }
+
+        var rows = await query.OrderByDescending(x => x.ProcessedAt).Take(500).ToListAsync();
+        // Only money that actually settled counts as captured revenue.
+        var captured = rows.Where(r => r.Status is "Approved" or "Captured").ToList();
+        return Ok(new
+        {
+            summary = new
+            {
+                count = rows.Count,
+                captured = captured.Count,
+                failed = rows.Count(r => r.Status is "Declined" or "Failed"),
+                pending = rows.Count(r => r.Status is "Pending" or "Authorized"),
+                capturedAmount = captured.Sum(r => r.Amount),
+                refundedAmount = rows.Sum(r => r.RefundedAmount),
+                online = rows.Count(r => r.Provider == "razorpay")
+            },
+            providers = await db.Payments.AsNoTracking().Select(p => p.Provider).Distinct().ToListAsync(),
+            statuses = await db.Payments.AsNoTracking().Select(p => p.Status).Distinct().ToListAsync(),
+            items = rows
+        });
+    }
+
+    [HttpGet("users")] public Task<List<object>> Users() => db.Users.AsNoTracking().OrderBy(u => u.Id)        .Select(u => (object)new { u.Id, u.Email, u.DisplayName, u.Role, u.CreatedAt }).ToListAsync();
 
     [HttpPut("users/{id:int}/role")]
     public async Task<IActionResult> UpdateRole(int id, UserRoleRequest request)
@@ -241,4 +303,23 @@ public class AdminController(ShopDbContext db, IPasswordService passwords) : Con
 
     [HttpGet("activity")]
     public Task<List<AuditActivity>> Activity() => db.AuditActivities.AsNoTracking().OrderByDescending(a => a.CreatedAt).Take(200).ToListAsync();
+
+    /// <summary>
+    /// Poll for activity newer than <paramref name="afterId"/> so the admin console can alert on
+    /// orders and customer activity. Passing no cursor returns only the latest id, which lets a
+    /// freshly opened console establish a baseline without replaying historic events as "new".
+    /// </summary>
+    [HttpGet("notifications")]
+    public async Task<IActionResult> Notifications([FromQuery] int? afterId = null)
+    {
+        var latestId = await db.AuditActivities.AsNoTracking().MaxAsync(a => (int?)a.Id) ?? 0;
+        if (afterId is null) return Ok(new { latestId, items = Array.Empty<AuditActivity>() });
+
+        var items = await db.AuditActivities.AsNoTracking()
+            .Where(a => a.Id > afterId)
+            .OrderBy(a => a.Id)
+            .Take(50)
+            .ToListAsync();
+        return Ok(new { latestId, items });
+    }
 }

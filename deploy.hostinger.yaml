@@ -1,0 +1,58 @@
+# Hostinger VPS: Traefik is installed by the VPS image and runs on the host network.
+# Supply SQL_SA_PASSWORD, SQL_APP_PASSWORD, JWT_SIGNING_KEY and the RAZORPAY_* keys in an untracked .env.
+services:
+  db:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Express
+      MSSQL_SA_PASSWORD: ${SQL_SA_PASSWORD:?Set SQL_SA_PASSWORD}
+      MSSQL_MEMORY_LIMIT_MB: "3072"
+    volumes:
+      - sql-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      PORT: "8080"
+      ConnectionStrings__DefaultConnection: "Server=db,1433;Database=Eshopper;User Id=bathany_app;Password=${SQL_APP_PASSWORD:?Set SQL_APP_PASSWORD};Encrypt=True;TrustServerCertificate=True"
+      Jwt__Issuer: TheBathany.Api
+      Jwt__Audience: TheBathany.Web
+      Jwt__SigningKey: ${JWT_SIGNING_KEY:?Set JWT_SIGNING_KEY}
+      Auth__ExposeResetToken: "false"
+      Razorpay__KeyId: ${RAZORPAY_KEY_ID:-}
+      Razorpay__KeySecret: ${RAZORPAY_KEY_SECRET:-}
+      Razorpay__WebhookSecret: ${RAZORPAY_WEBHOOK_SECRET:-}
+      # Order email. Leave EMAIL_HOST blank to keep mail switched off; the app degrades quietly.
+      Email__Host: ${EMAIL_HOST:-}
+      Email__Port: ${EMAIL_PORT:-587}
+      Email__UserName: ${EMAIL_USERNAME:-}
+      Email__Password: ${EMAIL_PASSWORD:-}
+      Email__FromAddress: ${EMAIL_FROM_ADDRESS:-donotreply@bathany.com}
+      Email__FromName: ${EMAIL_FROM_NAME:-The Bathany}
+      Email__ReplyTo: ${EMAIL_REPLY_TO:-}
+      Email__AdminRecipients: ${EMAIL_ADMIN_RECIPIENTS:-}
+      Email__StoreUrl: ${EMAIL_STORE_URL:-https://bathany.com}
+    ports:
+      - "127.0.0.1:8080:8080"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.bathany.rule=Host(`bathany.com`) || Host(`www.bathany.com`)"
+      - "traefik.http.routers.bathany.entrypoints=websecure"
+      - "traefik.http.routers.bathany.tls.certresolver=letsencrypt"
+      - "traefik.http.services.bathany.loadbalancer.server.port=8080"
+
+volumes:
+  sql-data:

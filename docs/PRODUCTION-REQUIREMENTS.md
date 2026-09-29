@@ -87,11 +87,11 @@ or a container image.
    only — **not** `db_owner`.
 5. Enable automated backups with point-in-time restore, and rehearse a restore.
 
-> **Known blocker.** EF Core 9 currently hangs against LocalDB on the development
-> machine, so the InMemory provider was used as a workaround. **The SQL Server path is
-> configured but has never been validated end-to-end through EF Core.** Run a full
-> regression (register → cart → checkout → admin) against real SQL Server before
-> go-live and budget time to resolve provider issues.
+> **Updated 27 September 2026.** The earlier LocalDB problem on the development
+> workstation did not reproduce on the Hostinger VPS. SQL Server 2022 Express was
+> validated end to end there (register → login → checkout → admin), including
+> persistence across container restarts. The hand-written SQL schema still needs
+> migrations for future upgrades. SQL Server Express limits a database to 10 GB.
 
 ### 1.6 Build and deploy
 
@@ -118,8 +118,9 @@ Health probes already exist: `GET /health` and `GET /ready`.
 - **Rate limiting** on `/api/auth/login`, `/register` and `/forgot-password`.
 - **Security headers**: CSP, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`.
 - **EF Core migrations** to replace the hand-written schema script.
-- **Real hosting** to replace the Cloudflare Quick Tunnel, which is ephemeral and issues
-  a new random URL on every restart.
+- **Offsite backups and a tested full restore.** The Hostinger VPS now hosts the
+  app and SQL Server with daily verified backups stored locally and weekly VPS
+  backups, but same-server `.bak` files do not protect against loss of that server.
 
 ---
 

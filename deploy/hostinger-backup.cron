@@ -1,0 +1,3 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+15 2 * * * root /opt/the-bathany/deploy/hostinger-backup.sh >> /var/log/the-bathany-backup.log 2>&1
