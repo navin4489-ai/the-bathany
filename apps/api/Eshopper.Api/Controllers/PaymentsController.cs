@@ -1,4 +1,5 @@
 using System.Security.Claims;
+using System.Text.Json.Serialization;
 using Eshopper.Api.Infrastructure;
 using Eshopper.Api.Services;
 using Microsoft.AspNetCore.Authorization;
@@ -8,6 +9,10 @@ namespace Eshopper.Api.Controllers;
 
 /// <summary>Items the shopper wants to pay for. The price is never taken from the request.</summary>
 public record RazorpayOrderRequest(IReadOnlyList<CartLine>? Items = null);
+public record VerifyPaymentRequest(
+    [property: JsonPropertyName("razorpay_order_id")] string? OrderId = null,
+    [property: JsonPropertyName("razorpay_payment_id")] string? PaymentId = null,
+    [property: JsonPropertyName("razorpay_signature")] string? Signature = null);
 
 [ApiController, Route("api/payments")]
 public class PaymentsController(IPaymentGateway gateway, IRazorpayGateway razorpay, ShopDbContext db, ILogger<PaymentsController> logger) : ControllerBase
@@ -19,22 +24,24 @@ public class PaymentsController(IPaymentGateway gateway, IRazorpayGateway razorp
     /// the simulated test methods are a development fallback and must never be offered in production.
     /// </summary>
     [HttpGet("methods")]
-    public IActionResult Methods()
+    public async Task<IActionResult> Methods()
     {
+        var allowed = await db.PaymentOptions.AsNoTracking().Where(x => x.Code == "razorpay").Select(x => x.Enabled).SingleAsync();
         var methods = new List<PaymentMethodInfo>();
-        if (razorpay.Enabled)
+        if (allowed && razorpay.Enabled)
             methods.Add(new(CheckoutService.RazorpayMethod, "Pay Online (Razorpay)", "UPI, cards, netbanking and wallets.", false));
-        else
+        else if (allowed)
             methods.AddRange(gateway.Methods);
 
         return Ok(new
         {
             provider = razorpay.Enabled ? "Razorpay" : "The Bathany Secure Pay",
             sandbox = true,
-            razorpayEnabled = razorpay.Enabled,
-            razorpayKeyId = razorpay.Enabled ? razorpay.KeyId : "",
+            razorpayEnabled = allowed && razorpay.Enabled,
+            razorpayKeyId = allowed && razorpay.Enabled ? razorpay.KeyId : "",
+            unavailableMessage = allowed ? "" : "Payments are temporarily disabled. Please try again later.",
             methods,
-            testCards = razorpay.Enabled ? Array.Empty<object>() : gateway.TestCards.Cast<object>().ToArray()
+            testCards = !allowed || razorpay.Enabled ? Array.Empty<object>() : gateway.TestCards.Cast<object>().ToArray()
         });
     }
 
@@ -44,29 +51,35 @@ public class PaymentsController(IPaymentGateway gateway, IRazorpayGateway razorp
     /// </summary>
     [Authorize]
     [HttpPost("razorpay/order")]
+    [HttpPost("/api/create-order")]
     public async Task<IActionResult> CreateRazorpayOrder(RazorpayOrderRequest request)
     {
         if (CurrentUserId() is not { } userId) return Unauthorized();
         if (!razorpay.Enabled) return Problem("Online payment is not available right now.", statusCode: 503);
+        if (!await db.PaymentOptions.AsNoTracking().Where(x => x.Code == "razorpay").Select(x => x.Enabled).SingleAsync())
+            return Problem("Payments are temporarily disabled. Please try again later.", statusCode: 503);
         if (request.Items is null || request.Items.Count == 0) return Problem("Your cart is empty.", statusCode: 400);
         if (request.Items.Any(i => i.Quantity < 1)) return Problem("Invalid quantity.", statusCode: 400);
+        var lines = request.Items.GroupBy(i => i.ProductId)
+            .Select(g => new { ProductId = g.Key, Quantity = g.Sum(i => (long)i.Quantity) }).ToList();
 
         var ids = request.Items.Select(i => i.ProductId).Distinct().ToList();
         var products = await db.Products.Where(p => ids.Contains(p.Id) && p.IsActive).ToDictionaryAsync(p => p.Id);
         if (products.Count != ids.Count) return Problem("One of the items is no longer available.", statusCode: 400);
-        if (request.Items.Any(i => products[i.ProductId].Stock < i.Quantity)) return Problem("One of the items is out of stock.", statusCode: 400);
+        if (lines.Any(i => products[i.ProductId].Stock < i.Quantity)) return Problem("One of the items is out of stock.", statusCode: 400);
 
-        var total = request.Items.Sum(i => products[i.ProductId].Price * i.Quantity);
-        if (total <= 0) return Problem("Order total must be greater than zero.", statusCode: 400);
+        var total = lines.Sum(i => products[i.ProductId].Price * i.Quantity);
+        if (total < 1m) return Problem("Minimum payment amount is 100 paise (INR 1).", statusCode: 400);
 
         try
         {
-            var order = await razorpay.CreateOrderAsync(total, $"bth-{userId}-{DateTime.UtcNow:yyMMddHHmmss}",
+            var order = await razorpay.CreateOrderAsync(total, $"bth-{Guid.NewGuid():N}",
                 new Dictionary<string, string> { ["userId"] = userId.ToString(), ["store"] = "The Bathany" }, HttpContext.RequestAborted);
             var user = await db.Users.AsNoTracking().Where(u => u.Id == userId).Select(u => new { u.Email, u.DisplayName }).SingleOrDefaultAsync();
             return Ok(new
             {
                 orderId = order.Id,
+                order_id = order.Id,
                 amount = order.AmountMinor,
                 currency = order.Currency,
                 keyId = razorpay.KeyId,
@@ -74,14 +87,44 @@ public class PaymentsController(IPaymentGateway gateway, IRazorpayGateway razorp
                 customer = new { name = user?.DisplayName ?? "", email = user?.Email ?? "" }
             });
         }
-        catch (InvalidOperationException ex)
+        catch (RazorpayApiException ex)
         {
-            return Problem(ex.Message, statusCode: 502);
+            return Problem(ex.Message, statusCode: ex.StatusCode,
+                extensions: new Dictionary<string, object?> { ["code"] = "payment_provider_error" });
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
         {
             logger.LogError(ex, "Could not reach Razorpay to create an order.");
-            return Problem("Could not reach the payment provider. Please try again.", statusCode: 504);
+            return Problem("Could not reach the payment provider. Please try again.", statusCode: 500);
+        }
+    }
+
+    [Authorize]
+    [HttpPost("razorpay/verify")]
+    [HttpPost("/api/verify-payment")]
+    public async Task<IActionResult> VerifyPayment(VerifyPaymentRequest request)
+    {
+        if (CurrentUserId() is not { } userId) return Unauthorized();
+        if (string.IsNullOrWhiteSpace(request.OrderId) || string.IsNullOrWhiteSpace(request.PaymentId) ||
+            string.IsNullOrWhiteSpace(request.Signature))
+            return Problem("Payment ID, order ID and signature are required.", statusCode: 400);
+        if (!razorpay.Enabled) return Problem("Online payment is not available right now.", statusCode: 503);
+        try
+        {
+            var result = await razorpay.VerifyAsync(request.OrderId, request.PaymentId, request.Signature, null, userId, HttpContext.RequestAborted);
+            if (!result.Success) return Problem(result.Error, statusCode: 400);
+            // Checkout persists the shop order after independently verifying the cart total.
+            return Ok(new { success = true, captured = result.Captured, payment_id = result.PaymentId, order_id = result.OrderId });
+        }
+        catch (RazorpayApiException ex)
+        {
+            return Problem(ex.Message, statusCode: ex.StatusCode,
+                extensions: new Dictionary<string, object?> { ["code"] = "payment_provider_error" });
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            logger.LogError(ex, "Could not reach Razorpay to verify payment.");
+            return Problem("Could not confirm payment. Please contact support before retrying.", statusCode: 500);
         }
     }
 

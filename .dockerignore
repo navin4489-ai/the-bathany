@@ -9,3 +9,5 @@ apps/api/Eshopper.Api/wwwroot
 .git
 .vs
 *.log
+.env
+.env.*

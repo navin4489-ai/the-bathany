@@ -25,3 +25,8 @@ apps/api/Eshopper.Api/wwwroot/uploads/
 Thumbs.db
 .DS_Store
 *.log
+
+# Local credentials
+.env
+.env.*
+!.env.example

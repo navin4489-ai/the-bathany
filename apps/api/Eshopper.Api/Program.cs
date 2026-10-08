@@ -34,7 +34,14 @@ builder.Services.AddScoped<ICatalogService, CatalogService>();
 builder.Services.AddScoped<ICheckoutService, CheckoutService>();
 builder.Services.AddSingleton<IPaymentGateway, DummyPaymentGateway>();
 builder.Services.AddSingleton<IPasswordService, PasswordService>();
+builder.Services.AddScoped<AppSessionService>();
+builder.Services.AddSingleton(AdminPushOptions.FromEnvironment());
+builder.Services.AddHostedService<AdminPushService>();
 var razorpayOptions = builder.Configuration.GetSection("Razorpay").Get<RazorpayOptions>() ?? new RazorpayOptions();
+if (string.IsNullOrWhiteSpace(razorpayOptions.KeyId))
+    razorpayOptions.KeyId = builder.Configuration["RAZORPAY_KEY_ID"] ?? "";
+if (string.IsNullOrWhiteSpace(razorpayOptions.KeySecret))
+    razorpayOptions.KeySecret = builder.Configuration["RAZORPAY_KEY_SECRET"] ?? "";
 builder.Services.AddSingleton(razorpayOptions);
 // A short timeout keeps a slow gateway from holding a checkout request open indefinitely.
 builder.Services.AddHttpClient<IRazorpayGateway, RazorpayGateway>(c => c.Timeout = TimeSpan.FromSeconds(20));
@@ -47,9 +54,24 @@ if (signingKey.Length < 32) throw new InvalidOperationException("Jwt:SigningKey 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(o =>
 {
     o.TokenValidationParameters = new TokenValidationParameters { ValidateIssuer = true, ValidIssuer = jwt["Issuer"], ValidateAudience = true, ValidAudience = jwt["Audience"], ValidateIssuerSigningKey = true, IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(signingKey)), ValidateLifetime = true, ClockSkew = TimeSpan.FromMinutes(1) };
+    o.Events = new JwtBearerEvents
+    {
+        OnTokenValidated = async context =>
+        {
+            var sessions = context.HttpContext.RequestServices.GetRequiredService<AppSessionService>();
+            if (context.Principal is null || !await sessions.ValidatePrincipalAsync(context.Principal, context.HttpContext.RequestAborted))
+                context.Fail("App session revoked.");
+        }
+    };
 });
 builder.Services.AddAuthorization(o => o.AddPolicy("AdminOnly", p => p.RequireRole("Admin")));
-builder.Services.AddCors(o => o.AddDefaultPolicy(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
+builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
+{
+    if (builder.Environment.IsDevelopment())
+        p.WithOrigins("http://localhost:4200").AllowCredentials().AllowAnyHeader().AllowAnyMethod();
+    else
+        p.WithOrigins("https://bathany.com", "https://www.bathany.com").AllowAnyHeader().AllowAnyMethod();
+}));
 
 var app = builder.Build();
 app.UseForwardedHeaders();

@@ -75,6 +75,12 @@ public class Payment
     public decimal RefundedAmount { get; set; }
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 }
+public class PaymentOption
+{
+    public string Code { get; set; } = "";
+    public bool Enabled { get; set; } = true;
+}
+
 public class AuditActivity
 {
     public int Id { get; set; }

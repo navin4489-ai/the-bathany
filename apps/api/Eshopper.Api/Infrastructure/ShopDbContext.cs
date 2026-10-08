@@ -42,8 +42,28 @@ public class ShopDbContext(DbContextOptions<ShopDbContext> options, IHttpContext
     public DbSet<PasswordResetToken> PasswordResetTokens => Set<PasswordResetToken>();
     public DbSet<ShippingAddress> ShippingAddresses => Set<ShippingAddress>();
     public DbSet<SavedAddress> SavedAddresses => Set<SavedAddress>();
+    public DbSet<PaymentOption> PaymentOptions => Set<PaymentOption>();
+    public DbSet<Offer> Offers => Set<Offer>();
+    public DbSet<AppSession> AppSessions => Set<AppSession>();
+    public DbSet<PushSubscription> PushSubscriptions => Set<PushSubscription>();
     protected override void OnModelCreating(ModelBuilder b)
     {
+        b.Entity<PushSubscription>().HasIndex(x => x.EndpointHash).IsUnique();
+        b.Entity<PushSubscription>().HasIndex(x => x.UserId);
+        b.Entity<PushSubscription>().HasIndex(x => x.AppSessionId);
+        b.Entity<PushSubscription>().HasIndex(x => new { x.Suspended, x.NextAttemptAt });
+        b.Entity<PushSubscription>().HasOne<User>().WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<PushSubscription>().HasOne<AppSession>().WithMany().HasForeignKey(x => x.AppSessionId).OnDelete(DeleteBehavior.NoAction);
+        b.Entity<AppSession>().HasIndex(x => x.TokenHash).IsUnique();
+        b.Entity<AppSession>().HasIndex(x => x.UserId);
+        b.Entity<AppSession>().HasOne(x => x.User).WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<Offer>().Property(x => x.Title).HasMaxLength(120);
+        b.Entity<Offer>().Property(x => x.Description).HasMaxLength(1000);
+        b.Entity<Offer>().Property(x => x.ImageUrl).HasMaxLength(200);
+        b.Entity<Offer>().HasIndex(x => new { x.Enabled, x.StartsAt, x.EndsAt });
+        b.Entity<PaymentOption>().HasKey(x => x.Code);
+        b.Entity<PaymentOption>().Property(x => x.Code).HasMaxLength(40);
+        b.Entity<PaymentOption>().HasData(new PaymentOption { Code = "razorpay", Enabled = true });
         b.Entity<User>().HasIndex(x => x.Email).IsUnique();
         b.Entity<PasswordResetToken>().HasIndex(x => x.TokenHash);
         b.Entity<Order>().HasIndex(x => new { x.UserId, x.IdempotencyKey }).IsUnique();

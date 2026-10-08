@@ -139,10 +139,16 @@ public class CheckoutService(ShopDbContext db, IPaymentGateway gateway, IRazorpa
         var existing = await db.Orders.Include(o => o.Payment).Include(o => o.Items).Include(o => o.ShippingAddress).SingleOrDefaultAsync(o => o.UserId == userId && o.IdempotencyKey == request.IdempotencyKey);
         if (existing is not null) return (existing, null);
         var products = await db.Products.Where(p => request.Items.Select(i => i.ProductId).Contains(p.Id)).ToDictionaryAsync(p => p.Id);
-        if (products.Count != request.Items.Select(i => i.ProductId).Distinct().Count() || request.Items.Any(i => i.Quantity < 1 || products[i.ProductId].Stock < i.Quantity)) return (null, "Product unavailable or invalid quantity.");
+        if (products.Count != request.Items.Select(i => i.ProductId).Distinct().Count() ||
+            request.Items.Any(i => i.Quantity < 1 || !products[i.ProductId].IsActive) ||
+            request.Items.GroupBy(i => i.ProductId).Any(g => products[g.Key].Stock < g.Sum(i => (long)i.Quantity)))
+            return (null, "Product unavailable or invalid quantity.");
 
         var method = (request.PaymentMethod ?? DummyPaymentGateway.Card).Trim().ToLowerInvariant();
         var isRazorpay = method == RazorpayMethod;
+        // Already-started Razorpay sessions must still finalize after an admin disables new payments.
+        if (!isRazorpay && !await db.PaymentOptions.AsNoTracking().Where(x => x.Code == RazorpayMethod).Select(x => x.Enabled).SingleAsync())
+            return (null, "Payments are temporarily disabled. Please try again later.");
         if (isRazorpay && !razorpay.Enabled) return (null, "Online payment is temporarily unavailable. Please choose another method.");
         // Once Razorpay is live it is the only accepted method; the simulated gateway is a
         // development fallback and must not be reachable by crafting a request.
@@ -151,6 +157,7 @@ public class CheckoutService(ShopDbContext db, IPaymentGateway gateway, IRazorpa
         // The total is always recomputed here from current database prices, so the amount verified
         // against the gateway is our figure and never one supplied by the browser.
         var total = request.Items.Sum(line => products[line.ProductId].Price * line.Quantity);
+        if (isRazorpay && total < 1m) return (null, "Minimum payment amount is 100 paise (INR 1).");
 
         // A Razorpay payment is confirmed with the provider *before* any stock is touched, so a
         // failed verification cannot leave reserved stock or a half-finished order behind.
@@ -164,7 +171,11 @@ public class CheckoutService(ShopDbContext db, IPaymentGateway gateway, IRazorpa
                 return (null, "This payment has already been used for another order.");
             try
             {
-                verified = await razorpay.VerifyAsync(confirmation.OrderId ?? "", confirmation.PaymentId ?? "", confirmation.Signature ?? "", total);
+                verified = await razorpay.VerifyAsync(confirmation.OrderId ?? "", confirmation.PaymentId ?? "", confirmation.Signature ?? "", total, userId);
+            }
+            catch (RazorpayApiException ex)
+            {
+                return (null, ex.Message);
             }
             catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
             {

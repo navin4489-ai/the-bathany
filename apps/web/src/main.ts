@@ -1,7 +1,7 @@
 import { bootstrapApplication } from '@angular/platform-browser';
-import { provideHttpClient } from '@angular/common/http';
+import { provideHttpClient, withInterceptors } from '@angular/common/http';
 import { ActivatedRoute, provideRouter, Router, RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
-import { Component, Injectable, LOCALE_ID, DEFAULT_CURRENCY_CODE, OnDestroy, NgZone, isDevMode, Input, Output, EventEmitter } from '@angular/core';
+import { Component, Injectable, LOCALE_ID, DEFAULT_CURRENCY_CODE, OnDestroy, NgZone, isDevMode, Input, Output, EventEmitter, inject, provideAppInitializer, ErrorHandler } from '@angular/core';
 import { CommonModule, CurrencyPipe, DatePipe, UpperCasePipe, registerLocaleData } from '@angular/common';
 import localeIn from '@angular/common/locales/en-IN';
 import { FormsModule } from '@angular/forms';
@@ -10,6 +10,9 @@ import { Observable, of } from 'rxjs';
 import { catchError } from 'rxjs/operators';
 import { timeout } from 'rxjs/operators';
 import { provideServiceWorker } from '@angular/service-worker';
+import { Offer, OfferBanners } from './offer-banners';
+import { AppSessionClient, appSessionInterceptor, APP_SESSION_API_ORIGIN } from './app-session';
+import { AdminPush, AdminPushControls } from './admin-push';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 
 registerLocaleData(localeIn);
@@ -40,6 +43,7 @@ export function imageSrc(url: string | null | undefined): string {
 
 @Injectable({ providedIn: 'root' })
 export class Api {
+  private sessions = inject(AppSessionClient);
   private readonly base = `${API_ORIGIN}/api`;
   constructor(private http: HttpClient) {}
   products(query = ''): Observable<Product[]> {
@@ -56,6 +60,9 @@ export class Api {
   checkout(body: unknown) { return this.http.post(`${this.base}/checkout`, body, { headers: this.authHeaders() }); }
   paymentMethods() { return this.http.get<any>(`${this.base}/payments/methods`).pipe(timeout(4000), catchError(() => of({ methods: [], testCards: [] }))); }
   razorpayOrder(body: unknown) { return this.http.post<any>(`${this.base}/payments/razorpay/order`, body, { headers: this.authHeaders() }); }
+  verifyRazorpay(body: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) {
+    return this.http.post<{ success: boolean; captured: boolean }>(`${this.base}/verify-payment`, body, { headers: this.authHeaders() });
+  }
   paymentHistory() { return this.http.get<any[]>(`${this.base}/payments/history`, { headers: this.authHeaders() }); }
   addresses() { return this.http.get<any[]>(`${this.base}/addresses`, { headers: this.authHeaders() }); }
   createAddress(body: unknown) { return this.http.post<any>(`${this.base}/addresses`, body, { headers: this.authHeaders() }); }
@@ -76,8 +83,13 @@ export class Api {
     data.append('file', file);
     return this.http.post<{ url: string }>(`${this.base}/admin/uploads/product-image`, data, { headers: this.authHeaders() });
   }
+  uploadOfferImage(file: File) {
+    const data = new FormData();
+    data.append('file', file);
+    return this.http.post<{ url: string }>(`${this.base}/admin/uploads/offer-image`, data, { headers: this.authHeaders() });
+  }
   login(body: unknown) { return this.http.post<{ accessToken: string }>(`${this.base}/auth/login`, body); }
-  logout() { return this.http.post(`${this.base}/auth/logout`, {}, { headers: this.authHeaders() }).pipe(catchError(() => of(null))); }
+  logout() { return this.sessions.logout(); }
   /** Fire-and-forget: tracking must never block or break the shopper's action. */
   track(action: string, productId: number, quantity?: number) {
     this.http.post(`${this.base}/activity`, { action, productId, quantity }, { headers: this.authHeaders() }).pipe(catchError(() => of(null))).subscribe();
@@ -91,6 +103,7 @@ export class Api {
 
 @Injectable({ providedIn: 'root' })
 export class Auth {
+  private sessions = inject(AppSessionClient);
   private decode(token: string): any {
     try { return JSON.parse(atob(token.split('.')[1])); } catch { return null; }
   }
@@ -99,7 +112,10 @@ export class Auth {
   get isLoggedIn() {
     const c = this.claims;
     if (!c) return false;
-    if (c.exp && c.exp * 1000 < Date.now()) { this.logout(); return false; }
+    if (c.exp && c.exp * 1000 < Date.now()) {
+      if (this.sessions.keepSignedInWhileRenewing) return true;
+      this.logout(); return false;
+    }
     return true;
   }
   get displayName() {
@@ -437,12 +453,14 @@ export class InstallGuide {
       <a routerLink="/ingredients" routerLinkActive="active">Ingredients</a>
       <a routerLink="/care" routerLinkActive="active">Care</a>
       <a routerLink="/about" routerLinkActive="active">About Us</a>
-      <a routerLink="/orders" routerLinkActive="active">My Orders</a>
+      <a *ngIf="auth.isLoggedIn" routerLink="/orders" routerLinkActive="active">My Orders</a>
       <a *ngIf="!auth.isLoggedIn" routerLink="/login" routerLinkActive="active">Login</a>
       <a *ngIf="!auth.isLoggedIn" routerLink="/register" routerLinkActive="active">Sign up</a>
       <a *ngIf="auth.isAdmin" routerLink="/admin" routerLinkActive="active">Admin</a>
     </nav>
     <main><router-outlet></router-outlet></main>
+    <p class="pay-error page" *ngIf="sessions.state() === 'unavailable'" role="alert">Your app session could not be renewed. Check your connection and try again. You have not been signed out.</p>
+    <p class="pay-error page" *ngIf="logoutError" role="alert">{{ logoutError }} <button class="link-btn" [disabled]="signingOut" (click)="logout()">Retry sign out</button></p>
     <div class="toast" role="status" aria-live="polite" *ngIf="toast.message">✓ {{ toast.message }}</div>
     <footer class="site-footer">
       <div class="footer-brand">
@@ -474,12 +492,37 @@ export class InstallGuide {
 export class App {
   year = new Date().getFullYear();
   menuOpen = false;
+  signingOut = false;
+  logoutError = '';
+  sessions = inject(AppSessionClient);
+  private adminPush = inject(AdminPush);
   constructor(public cart: CartStore, public toast: Toast, public auth: Auth, public wishlist: WishlistStore, public installService: AppInstall, private router: Router, private api: Api) {}
-  logout(event?: Event) { event?.preventDefault(); this.api.logout().subscribe(); this.auth.logout(); this.toast.show('You have been signed out'); this.router.navigateByUrl('/'); }
+  async logout(event?: Event) {
+    event?.preventDefault();
+    if (this.signingOut) return;
+    this.signingOut = true;
+    this.logoutError = '';
+    try {
+      if (this.auth.isAdmin) await this.adminPush.disableForLogout();
+    } catch (error) {
+      console.error('Unable to remove this device notification subscription', error);
+      this.logoutError = 'Could not disable this device notifications. Sign out was not completed; please retry.';
+      this.signingOut = false;
+      return;
+    }
+    this.api.logout().subscribe({
+      next: () => { this.signingOut = false; this.toast.show('You have been signed out'); this.router.navigateByUrl('/'); },
+      error: () => {
+        this.signingOut = false;
+        this.logoutError = 'Signed out on this device, but the server could not revoke the session. Reconnect and retry sign out.';
+        this.router.navigateByUrl('/');
+      }
+    });
+  }
 }
 
 @Component({
-  standalone: true, imports: [CommonModule, FormsModule, CurrencyPipe, RouterLink],
+  standalone: true, imports: [CommonModule, FormsModule, CurrencyPipe, RouterLink, OfferBanners],
   template: `
     <div class="page">
       <section class="hero">
@@ -503,6 +546,7 @@ export class App {
         <div><strong>Sulfate Free</strong><span>Gentle on every skin type</span></div>
         <div><strong>Handcrafted</strong><span>Whipped in small batches</span></div>
       </section>
+      <app-offer-banners [apiOrigin]="apiOrigin"></app-offer-banners>
       <div class="section-heading" id="collection"><h2>The collection</h2><span class="muted">Four rituals, endlessly whimsical</span></div>
       <div class="toolbar"><input [(ngModel)]="query" (ngModelChange)="load()" placeholder="Search the collection"></div>
       <section class="grid"><article class="product-card" *ngFor="let p of products"><a [routerLink]="['/detail', p.id]"><img [src]="img(p.imageUrl)" [alt]="p.name"></a><button class="wish-btn" [class.on]="wishlist.has(p.id)" (click)="wishlist.toggle(p)" [attr.aria-pressed]="wishlist.has(p.id)" [attr.aria-label]="(wishlist.has(p.id) ? 'Remove ' + p.name + ' from wishlist' : 'Save ' + p.name + ' to wishlist')">{{ wishlist.has(p.id) ? '♥' : '♡' }}</button><div class="product-info"><h3><a [routerLink]="['/detail', p.id]">{{ p.name }}</a></h3><p>{{ p.description }}</p><span class="price">{{ p.price | currency }}</span><button class="btn-primary" (click)="cart.add(p)">Add to cart</button></div></article></section>
@@ -510,6 +554,7 @@ export class App {
   `
 })
 export class Shop implements OnDestroy {
+  apiOrigin = API_ORIGIN;
   products: Product[] = []; query = '';
   slides = ['assets/brand/product-4.jpeg', 'assets/brand/product-1.jpeg', 'assets/brand/product-3.jpeg', 'assets/brand/product-2.jpeg'];
   activeSlide = 0;
@@ -602,8 +647,8 @@ export class Detail {
           </div>
         </div>
         <div class="pay-panel">
-          <div class="pay-brand"><span class="pay-badge">{{ razorpayEnabled ? 'Secure' : 'Sandbox' }}</span><strong>{{ razorpayEnabled ? 'Razorpay Secure Checkout' : 'The Bathany Secure Pay' }}</strong></div>
-          <p class="muted pay-note" *ngIf="!razorpayEnabled">No real money moves. Use a test card below to simulate results.</p>
+          <div class="pay-brand"><span class="pay-badge">{{ !methods.length ? 'Unavailable' : razorpayEnabled ? 'Secure' : 'Sandbox' }}</span><strong>{{ !methods.length ? 'Payments unavailable' : razorpayEnabled ? 'Razorpay Secure Checkout' : 'The Bathany Secure Pay' }}</strong></div>
+          <p class="muted pay-note" *ngIf="methods.length && !razorpayEnabled">No real money moves. Use a test card below to simulate results.</p>
 
           <div class="pay-methods" *ngIf="methods.length > 1">
             <button type="button" class="pay-method" *ngFor="let m of methods" [class.selected]="method === m.code" (click)="method = m.code">
@@ -634,7 +679,8 @@ export class Detail {
             </details>
           </div>
 
-          <button class="btn-primary pay-submit" [disabled]="!cart.lines.length || placing" (click)="checkout()">{{ placing ? 'Processing payment…' : 'Pay ' + (cart.total() | currency) }}</button>
+          <p class="pay-error" *ngIf="!methods.length">{{ paymentUnavailable }}</p>
+          <button class="btn-primary pay-submit" [disabled]="!cart.lines.length || placing || !methods.length" (click)="checkout()">{{ placing ? 'Processing payment…' : 'Pay ' + (cart.total() | currency) }}</button>
           <p class="pay-error" *ngIf="message">{{ message }}</p>
         </div>
       </div>
@@ -685,6 +731,7 @@ export class Cart implements OnDestroy {
   addressMessage = '';
   states = ['Andhra Pradesh','Arunachal Pradesh','Assam','Bihar','Chhattisgarh','Delhi','Goa','Gujarat','Haryana','Himachal Pradesh','Jammu & Kashmir','Jharkhand','Karnataka','Kerala','Madhya Pradesh','Maharashtra','Manipur','Meghalaya','Mizoram','Nagaland','Odisha','Puducherry','Punjab','Rajasthan','Sikkim','Tamil Nadu','Telangana','Tripura','Uttar Pradesh','Uttarakhand','West Bengal'];
   methods: any[] = [];
+  paymentUnavailable = 'Payment options are unavailable. Please refresh and try again.';
   testCards: any[] = [];
   razorpayEnabled = false;
   private razorpayKeyId = '';
@@ -692,12 +739,13 @@ export class Cart implements OnDestroy {
   constructor(public cart: CartStore, private api: Api, private auth: Auth, private router: Router, private zone: NgZone) {
     this.loadAddresses();
     this.api.paymentMethods().subscribe(res => {
-      this.methods = res?.methods?.length ? res.methods : [{ code: 'card', label: 'Credit / Debit Card', description: 'Pay securely with a test card.', requiresCard: true }];
+      this.methods = res?.methods || [];
+      this.paymentUnavailable = res?.unavailableMessage || 'Payment options are unavailable. Please refresh and try again.';
       this.testCards = res?.testCards || [];
       this.razorpayEnabled = !!res?.razorpayEnabled;
       this.razorpayKeyId = res?.razorpayKeyId || '';
       // Default to online payment when it is available, since that is the real gateway.
-      if (this.razorpayEnabled && this.methods.some(m => m.code === 'razorpay')) this.method = 'razorpay';
+      this.method = this.methods.find(m => m.code === 'razorpay')?.code || this.methods[0]?.code || '';
       if (this.razorpayEnabled) Cart.loadRazorpay();
     });
   }
@@ -854,6 +902,8 @@ export class Cart implements OnDestroy {
   }
 
   checkout() {
+    if (this.placing) return;
+    if (!this.methods.length) { this.message = this.paymentUnavailable; return; }
     if (!this.auth.isLoggedIn) { this.router.navigate(['/login'], { queryParams: { returnUrl: '/cart' } }); return; }
     if (this.showAddressForm && this.savedAddresses.length) { this.message = 'Please save or cancel the address you are editing first.'; return; }
     const addressError = this.validateAddress();
@@ -875,6 +925,7 @@ export class Cart implements OnDestroy {
     const items = this.cart.lines.map(line => ({ productId: line.product.id, quantity: line.quantity }));
     this.api.razorpayOrder({ items }).subscribe({
       next: (session: any) => {
+        let finalizing = false;
         const options: any = {
           key: session.keyId || this.razorpayKeyId,
           amount: session.amount,
@@ -888,15 +939,30 @@ export class Cart implements OnDestroy {
           theme: { color: '#7a5c48' },
           // The browser only relays these values; the server re-verifies every one of them.
           // Razorpay calls these from outside Angular, so re-enter the zone or the UI never updates.
-          handler: (response: any) => this.zone.run(() => this.placeOrder({
-            razorpay: {
-              orderId: response.razorpay_order_id,
-              paymentId: response.razorpay_payment_id,
-              signature: response.razorpay_signature
+          handler: (response: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) => this.zone.run(() => {
+            if (finalizing) return;
+            finalizing = true;
+            if (response.razorpay_order_id !== session.orderId) {
+              this.placing = false;
+              this.message = 'The payment confirmation does not match this checkout. Please contact support.';
+              return;
             }
-          })),
+            this.api.verifyRazorpay(response).subscribe({
+              next: () => this.placeOrder({
+                razorpay: {
+                  orderId: session.orderId,
+                  paymentId: response.razorpay_payment_id,
+                  signature: response.razorpay_signature
+                }
+              }),
+              error: error => {
+                this.placing = false;
+                this.message = error.error?.detail || 'Could not verify payment. Please contact support before retrying.';
+              }
+            });
+          }),
           modal: {
-            ondismiss: () => this.zone.run(() => { if (this.confirmed) return; this.placing = false; this.message = 'Payment was cancelled. Your cart is unchanged.'; })
+            ondismiss: () => this.zone.run(() => { if (finalizing || this.confirmed) return; this.placing = false; this.message = 'Payment was cancelled. Your cart is unchanged.'; })
           }
         };
         try {
@@ -913,7 +979,7 @@ export class Cart implements OnDestroy {
       },
       error: error => {
         this.placing = false;
-        if (error.status === 401) { this.auth.logout(); this.router.navigate(['/login'], { queryParams: { returnUrl: '/cart' } }); return; }
+        if (error.status === 401 && error.error?.code !== 'payment_provider_error') { this.auth.logout(); this.router.navigate(['/login'], { queryParams: { returnUrl: '/cart' } }); return; }
         this.message = error.error?.detail || 'Could not start the payment. Please try again.';
       }
     });
@@ -1144,7 +1210,7 @@ export class Payments {
 
 
 @Component({
-  standalone: true, imports: [CommonModule, FormsModule, DatePipe, CurrencyPipe, Pager],
+  standalone: true, imports: [CommonModule, FormsModule, DatePipe, CurrencyPipe, Pager, AdminPushControls],
   template: `<div class="page admin">
     <div class="section-heading">
       <div class="admin-title"><img class="admin-crest" src="assets/brand/logo.jpeg" alt="The Bathany"><div><div class="eyebrow">The Bathany</div><h1>Admin console</h1></div></div>
@@ -1160,6 +1226,7 @@ export class Payments {
       </div>
     </div>
     <p class="admin-alert" *ngIf="latestAlert" role="status" aria-live="polite">🔔 {{ latestAlert }}</p>
+    <app-admin-push></app-admin-push>
     <p class="pay-error" *ngIf="error">{{ error }}</p>
     <p class="admin-flash" *ngIf="message">{{ message }}</p>
 
@@ -1245,6 +1312,45 @@ export class Payments {
       <app-pager [total]="q.products.total" [page]="q.products.page" [pageSize]="q.products.size" (pageChange)="reload('products', $event)" (sizeChange)="resize('products', $event)"></app-pager>
     </section>
 
+    <section *ngIf="section === 'offers'">
+      <div class="admin-subhead"><h2>Offer banners</h2><button class="btn-primary" (click)="editOffer()">+ Add offer</button></div>
+      <p class="muted">Promotional banners link to the shop. They do not change checkout prices. Dates below use your device's local time.</p>
+      <form class="admin-form" *ngIf="offerForm" (ngSubmit)="saveOffer()">
+        <h3>{{ offerForm.id ? 'Edit offer' : 'New offer' }}</h3>
+        <label>Title<input [(ngModel)]="offerForm.title" name="offerTitle" maxlength="120" required></label>
+        <label>Description<textarea [(ngModel)]="offerForm.description" name="offerDescription" maxlength="1000"></textarea></label>
+        <div class="form-row">
+          <label>Valid from<input type="datetime-local" [(ngModel)]="offerForm.startsAt" name="offerStartsAt" required></label>
+          <label>Valid until<input type="datetime-local" [(ngModel)]="offerForm.endsAt" name="offerEndsAt" required></label>
+          <label class="check">Enabled<input type="checkbox" [(ngModel)]="offerForm.enabled" name="offerEnabled"></label>
+        </div>
+        <div class="upload-row">
+          <label>Offer image<input type="file" accept="image/png,image/jpeg,image/gif,image/webp" [disabled]="uploadingOffer || savingOffer" (change)="uploadOffer($event)"></label>
+          <img class="upload-preview" *ngIf="offerForm.imageUrl" [src]="img(offerForm.imageUrl)" alt="Offer preview">
+        </div>
+        <p class="muted">JPG, PNG, GIF or WEBP, up to 4 MB.</p>
+        <div class="form-actions">
+          <button class="btn-primary" type="submit" [disabled]="savingOffer || uploadingOffer">{{ uploadingOffer ? 'Uploading...' : savingOffer ? 'Saving...' : 'Save offer' }}</button>
+          <button class="link-btn" type="button" [disabled]="savingOffer || uploadingOffer" (click)="offerForm = null">Cancel</button>
+        </div>
+      </form>
+      <div class="pay-filters"><input [(ngModel)]="q.offers.search" (keyup.enter)="reload('offers', 1)" placeholder="Search offers"><button class="btn-light" (click)="reload('offers', 1)">Search</button></div>
+      <table class="data-table">
+        <thead><tr><th>Image</th><th>Offer</th><th>Valid from</th><th>Valid until</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody>
+          <tr *ngFor="let offer of offers">
+            <td><img class="row-thumb" [src]="img(offer.imageUrl)" [alt]="offer.title"></td>
+            <td><strong>{{ offer.title }}</strong><br>{{ offer.description }}</td>
+            <td>{{ offer.startsAt | date:'medium' }}</td><td>{{ offer.endsAt | date:'medium' }}</td>
+            <td>{{ offerStatus(offer) }}</td>
+            <td class="row-actions"><button class="link-btn" [disabled]="savingOffer" (click)="editOffer(offer)">Edit</button><button class="link-btn" [disabled]="savingOffer" (click)="toggleOffer(offer)">{{ offer.enabled ? 'Disable' : 'Enable' }}</button><button class="link-btn danger" [disabled]="savingOffer" (click)="deleteOffer(offer)">Delete</button></td>
+          </tr>
+          <tr *ngIf="!offers.length"><td colspan="6" class="muted">No offers found.</td></tr>
+        </tbody>
+      </table>
+      <app-pager [total]="q.offers.total" [page]="q.offers.page" [pageSize]="q.offers.size" (pageChange)="reload('offers', $event)" (sizeChange)="resize('offers', $event)"></app-pager>
+    </section>
+
     <!-- Orders -->
     <section *ngIf="section === 'orders'">
       <div class="admin-subhead">
@@ -1288,6 +1394,19 @@ export class Payments {
 
     <!-- Payments -->
     <section *ngIf="section === 'payments'">
+      <div class="checkout-panel">
+        <h2>Payment options</h2>
+        <p class="pay-error" *ngIf="paymentOptionError">{{ paymentOptionError }}</p>
+        <div *ngIf="paymentOption">
+          <strong>Razorpay</strong>
+          <span class="pill" [attr.data-status]="paymentOption.enabled ? 'Active' : 'Inactive'">{{ paymentOption.enabled ? 'Enabled' : 'Disabled' }}</span>
+          <p class="muted">Disabling blocks new payment sessions. Existing payments can still be verified and completed. Other payment methods remain hidden.</p>
+          <p class="pay-error" *ngIf="!paymentOption.configured">Razorpay credentials are not configured. Enabling this option does not configure API keys.</p>
+          <button class="btn-light" [disabled]="savingPaymentOption" (click)="togglePaymentOption()">
+            {{ savingPaymentOption ? 'Saving…' : paymentOption.enabled ? 'Disable Razorpay' : 'Enable Razorpay' }}
+          </button>
+        </div>
+      </div>
       <div class="admin-subhead">
         <h2>Payments</h2>
         <div class="pay-filters">
@@ -1409,6 +1528,7 @@ export class Admin implements OnDestroy {
     sections: [
       { key: 'dashboard', label: 'Dashboard', icon: '\u25a4' },
       { key: 'products', label: 'Products', icon: '\u25a6' },
+      { key: 'offers', label: 'Offers', icon: '\u2605' },
       { key: 'orders', label: 'Orders', icon: '\ud83e\uddfe' },
       { key: 'payments', label: 'Payments', icon: '\ud83d\udcb3' },
       { key: 'users', label: 'Users', icon: '\ud83d\udc65' },
@@ -1419,15 +1539,23 @@ export class Admin implements OnDestroy {
   stats: any = {};
   products: any[] = []; orders: any[] = []; users: any[] = []; activity: any[] = []; latestOrders: any[] = [];
   activityActions: string[] = [];
+  offers: Offer[] = [];
+  offerForm: { id?: number; title: string; description: string; imageUrl: string; enabled: boolean; startsAt: string; endsAt: string } | null = null;
+  savingOffer = false;
+  uploadingOffer = false;
   /** Per-table paging and filter state. Every admin table is paged on the server. */
   q: any = {
     products: { page: 1, size: 10, total: 0, search: '' },
+    offers: { page: 1, size: 10, total: 0, search: '' },
     orders: { page: 1, size: 10, total: 0, search: '', status: '' },
     payments: { page: 1, size: 10, total: 0 },
     users: { page: 1, size: 10, total: 0, search: '', role: '' },
     activity: { page: 1, size: 20, total: 0, search: '', action: '', userId: null, userLabel: '' }
   };
   paymentData: any = { summary: {}, items: [], providers: [], statuses: [] };
+  paymentOption: { code: string; label: string; enabled: boolean; configured: boolean } | null = null;
+  paymentOptionError = '';
+  savingPaymentOption = false;
   paymentSearch = ''; paymentStatus = ''; paymentProvider = '';
   editing: any = null;
   resetFor: number | null = null; newPassword = '';
@@ -1494,9 +1622,10 @@ export class Admin implements OnDestroy {
   load() {
     this.error = '';
     this.loadConfig();
+    this.loadPaymentOption();
     this.api.admin('stats').subscribe({ next: s => this.stats = s, error: () => this.error = 'Sign in as an admin to load data.' });
     this.api.admin('orders?page=1&pageSize=5').subscribe({ next: d => this.latestOrders = d.items || [], error: () => this.latestOrders = [] });
-    (['products', 'orders', 'users', 'activity', 'payments'] as const).forEach(t => this.reload(t));
+    (['products', 'orders', 'users', 'activity', 'payments', 'offers'] as const).forEach(t => this.reload(t));
     this.lastLoaded = new Date();
   }
 
@@ -1527,6 +1656,33 @@ export class Admin implements OnDestroy {
 
   resize(table: string, size: number) { this.q[table].size = size; this.reload(table, 1); }
 
+  private loadPaymentOption() {
+    if (this.savingPaymentOption) return;
+    this.api.admin('payment-options').subscribe({
+      next: option => { this.paymentOption = option; this.paymentOptionError = ''; },
+      error: () => { this.paymentOption = null; this.paymentOptionError = 'Could not load payment settings. Use Refresh to retry.'; }
+    });
+  }
+
+  togglePaymentOption() {
+    if (!this.paymentOption || this.savingPaymentOption) return;
+    const enabled = !this.paymentOption.enabled;
+    this.savingPaymentOption = true;
+    this.paymentOptionError = '';
+    this.api.adminPut('payment-options/razorpay', { enabled }).subscribe({
+      next: option => {
+        this.paymentOption = option;
+        this.savingPaymentOption = false;
+        this.flash(`Razorpay payments ${enabled ? 'enabled' : 'disabled'}.`);
+        this.reload('activity');
+      },
+      error: err => {
+        this.savingPaymentOption = false;
+        this.paymentOptionError = err.error?.detail || 'Could not update payment settings. Please refresh and try again.';
+      }
+    });
+  }
+
   viewUserActivity(u: any) {
     Object.assign(this.q.activity, { userId: u.id, userLabel: u.email, action: '', search: '' });
     this.section = 'activity';
@@ -1555,6 +1711,64 @@ export class Admin implements OnDestroy {
   private fail(err: any, fallbackText: string) { this.saving = false; this.error = err?.error?.detail || err?.error?.title || fallbackText; }
 
   newProduct() { this.editing = { name: '', description: '', price: 0, stock: 0, imageUrl: '', categoryId: this.config.categories[0]?.id || 1, isActive: true }; }
+  private localDate(value: string | Date) {
+    const date = new Date(value);
+    return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  }
+  editOffer(offer?: Offer) {
+    if (this.savingOffer || this.uploadingOffer) { this.error = 'Wait for the current offer operation to finish.'; return; }
+    this.offerForm = offer
+      ? { ...offer, startsAt: this.localDate(offer.startsAt), endsAt: this.localDate(offer.endsAt) }
+      : { title: '', description: '', imageUrl: '', enabled: true, startsAt: this.localDate(new Date()), endsAt: this.localDate(new Date(Date.now() + 7 * 86400000)) };
+  }
+  offerStatus(offer: Offer) {
+    if (!offer.enabled) return 'Disabled';
+    if (Date.parse(offer.endsAt) <= Date.now()) return 'Expired';
+    return Date.parse(offer.startsAt) > Date.now() ? 'Scheduled' : 'Active';
+  }
+  uploadOffer(event: Event) {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    const form = this.offerForm;
+    if (!file || !form) return;
+    this.uploadingOffer = true;
+    this.error = '';
+    this.api.uploadOfferImage(file).subscribe({
+      next: result => { form.imageUrl = result.url; this.uploadingOffer = false; input.value = ''; },
+      error: err => { this.uploadingOffer = false; input.value = ''; this.error = err.error?.detail || 'Could not upload the offer image.'; }
+    });
+  }
+  saveOffer() {
+    const form = this.offerForm;
+    if (!form || this.savingOffer || this.uploadingOffer) return;
+    const starts = new Date(form.startsAt), ends = new Date(form.endsAt);
+    if (!form.title.trim() || !form.imageUrl || !Number.isFinite(starts.getTime()) || !Number.isFinite(ends.getTime()) || ends <= starts) {
+      this.error = 'Enter a title, upload an image, and set an end time after the start time.';
+      return;
+    }
+    const body = { ...form, startsAt: starts.toISOString(), endsAt: ends.toISOString() };
+    this.savingOffer = true;
+    (form.id ? this.api.adminPut(`offers/${form.id}`, body) : this.api.adminPost('offers', body)).subscribe({
+      next: () => { this.savingOffer = false; this.offerForm = null; this.flash('Offer saved. Active banners will appear in the shop.'); this.reload('offers'); },
+      error: err => { this.savingOffer = false; this.error = err.error?.detail || 'Could not save the offer.'; }
+    });
+  }
+  toggleOffer(offer: Offer) {
+    if (this.savingOffer) return;
+    this.savingOffer = true;
+    this.api.adminPut(`offers/${offer.id}`, { ...offer, enabled: !offer.enabled }).subscribe({
+      next: () => { this.savingOffer = false; this.flash(`Offer ${offer.enabled ? 'disabled' : 'enabled'}.`); this.reload('offers'); },
+      error: err => { this.savingOffer = false; this.error = err.error?.detail || 'Could not change offer availability.'; }
+    });
+  }
+  deleteOffer(offer: Offer) {
+    if (this.savingOffer || !confirm(`Delete offer "${offer.title}"?`)) return;
+    this.savingOffer = true;
+    this.api.adminDelete(`offers/${offer.id}`).subscribe({
+      next: () => { this.savingOffer = false; this.flash('Offer deleted.'); this.reload('offers'); },
+      error: err => { this.savingOffer = false; this.error = err.error?.detail || 'Could not delete the offer.'; }
+    });
+  }
   editProduct(p: any) { this.editing = { ...p }; }
 
   uploadImage(event: Event) {
@@ -1963,7 +2177,18 @@ function dismissSplash() {
   });
 }
 
-bootstrapApplication(App, { providers: [provideHttpClient(), { provide: LOCALE_ID, useValue: 'en-IN' }, { provide: DEFAULT_CURRENCY_CODE, useValue: 'INR' }, provideRouter([{ path: '', component: Shop }, { path: 'shop', component: Shop }, { path: 'detail/:id', component: Detail }, { path: 'rituals', component: Rituals }, { path: 'ingredients', component: Ingredients }, { path: 'care', component: Care }, { path: 'about', component: About }, { path: 'contact', component: Contact }, { path: 'cart', component: Cart }, { path: 'wishlist', component: Wishlist }, { path: 'install/:platform', component: InstallGuide }, { path: 'login', component: Login }, { path: 'register', component: Register }, { path: 'forgot-password', component: ForgotPassword }, { path: 'reset-password', component: ResetPassword }, { path: 'orders', component: Orders }, { path: 'payments', component: Payments }, { path: 'admin', component: Admin }]), provideServiceWorker('ngsw-worker.js', {
+bootstrapApplication(App, { providers: [
+  provideHttpClient(withInterceptors([appSessionInterceptor])),
+  { provide: APP_SESSION_API_ORIGIN, useValue: API_ORIGIN },
+  provideAppInitializer(() => {
+    const sessions = inject(AppSessionClient);
+    const errors = inject(ErrorHandler);
+    return sessions.bootstrap().catch(error => {
+      // Render the offline-session warning rather than leaving the app stuck at bootstrap.
+      errors.handleError(error);
+    });
+  }),
+  { provide: LOCALE_ID, useValue: 'en-IN' }, { provide: DEFAULT_CURRENCY_CODE, useValue: 'INR' }, provideRouter([{ path: '', component: Shop }, { path: 'shop', component: Shop }, { path: 'detail/:id', component: Detail }, { path: 'rituals', component: Rituals }, { path: 'ingredients', component: Ingredients }, { path: 'care', component: Care }, { path: 'about', component: About }, { path: 'contact', component: Contact }, { path: 'cart', component: Cart }, { path: 'wishlist', component: Wishlist }, { path: 'install/:platform', component: InstallGuide }, { path: 'login', component: Login }, { path: 'register', component: Register }, { path: 'forgot-password', component: ForgotPassword }, { path: 'reset-password', component: ResetPassword }, { path: 'orders', component: Orders }, { path: 'payments', component: Payments }, { path: 'admin', component: Admin }]), provideServiceWorker('ngsw-worker.js', {
             enabled: !isDevMode(),
             registrationStrategy: 'registerWhenStable:30000'
           })] }).then(dismissSplash).catch(err => { dismissSplash(); console.error(err); });

@@ -477,4 +477,8 @@ a.wishlist { color: var(--primary-dark); }
 .pager-size select { margin-left: 6px; padding: 5px 8px; border: 1px solid #ddd; border-radius: 4px; font: inherit; }
 .table-filters { margin-top: 12px; }
 .ip { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+.offer-banners { margin: 24px 0; }
+.offer-banner { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: center; gap: 24px; padding: 20px; margin-bottom: 20px; background: #fcfaf6; border-radius: 12px; }
+.offer-banner img { width: 100%; max-height: 320px; object-fit: contain; border-radius: 8px; }
+@media (max-width: 640px) { .offer-banner { grid-template-columns: 1fr; gap: 12px; } }
 @media (max-width: 640px) { .pager { justify-content: center; } }

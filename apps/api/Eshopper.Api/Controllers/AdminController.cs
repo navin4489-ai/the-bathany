@@ -11,11 +11,12 @@ public record AdminResetPasswordRequest(string NewPassword);
 public record ProductRequest(string? Name = null, string? Description = null, decimal Price = 0, int Stock = 0, string? ImageUrl = null, int CategoryId = 1, bool IsActive = true);
 public record OrderStatusRequest(string? Status = null);
 public record UserRoleRequest(string? Role = null);
+public record PaymentOptionRequest(bool? Enabled = null);
 public record PageResult(object Items, int Total, int Page, int PageSize, int Pages);
 
 [ApiController, Route("api/admin")]
 [Authorize(Policy = "AdminOnly")]
-public class AdminController(ShopDbContext db, IPasswordService passwords, IEmailService email) : ControllerBase
+public class AdminController(ShopDbContext db, IPasswordService passwords, IEmailService email, IRazorpayGateway razorpay, AppSessionService sessions) : ControllerBase
 {
     private static readonly string[] OrderStatuses = ["Pending", "Paid", "Processing", "Shipped", "Delivered", "Cancelled", "Refunded", "PaymentFailed"];
     private static readonly string[] Roles = ["Customer", "Admin"];
@@ -24,6 +25,27 @@ public class AdminController(ShopDbContext db, IPasswordService passwords, IEmai
         db.AuditActivities.Add(new AuditActivity { Action = action, Details = details, UserId = CurrentUserId() });
 
     private int? CurrentUserId() => int.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out var id) ? id : null;
+
+    [HttpGet("payment-options")]
+    public async Task<IActionResult> PaymentOptions()
+    {
+        var enabled = await db.PaymentOptions.AsNoTracking().Where(x => x.Code == "razorpay").Select(x => x.Enabled).SingleAsync();
+        return Ok(new { code = "razorpay", label = "Razorpay", enabled, configured = razorpay.Enabled });
+    }
+
+    [HttpPut("payment-options/razorpay")]
+    public async Task<IActionResult> UpdatePaymentOption(PaymentOptionRequest request)
+    {
+        if (request.Enabled is not { } enabled) return Problem("Enabled is required.", statusCode: 400);
+        var option = await db.PaymentOptions.SingleAsync(x => x.Code == "razorpay");
+        if (option.Enabled != enabled)
+        {
+            option.Enabled = enabled;
+            Audit("PaymentOptionChanged", $"Razorpay payments {(enabled ? "enabled" : "disabled")}");
+            await db.SaveChangesAsync();
+        }
+        return Ok(new { code = option.Code, label = "Razorpay", option.Enabled, configured = razorpay.Enabled });
+    }
 
     /// <summary>Uniform page envelope so every admin table paginates the same way.</summary>
     private static async Task<PageResult> Page<T>(IQueryable<T> query, int page, int pageSize, Func<List<T>, object>? project = null)
@@ -48,6 +70,7 @@ public class AdminController(ShopDbContext db, IPasswordService passwords, IEmai
         {
             new { key = "dashboard", label = "Dashboard", icon = "\u25a4" },
             new { key = "products", label = "Products", icon = "\u25a6" },
+            new { key = "offers", label = "Offers", icon = "\u2605" },
             new { key = "orders", label = "Orders", icon = "\ud83e\uddfe" },
             new { key = "payments", label = "Payments", icon = "\ud83d\udcb3" },
             new { key = "users", label = "Users", icon = "\ud83d\udc65" },
@@ -76,6 +99,7 @@ public class AdminController(ShopDbContext db, IPasswordService passwords, IEmai
 
     /// <summary>Accepts a product image upload and returns the public URL to store on the product.</summary>
     [HttpPost("uploads/product-image")]
+    [HttpPost("uploads/offer-image")]
     [RequestSizeLimit(4 * 1024 * 1024)]
     public async Task<IActionResult> UploadProductImage(IFormFile? file)
     {
@@ -94,9 +118,11 @@ public class AdminController(ShopDbContext db, IPasswordService passwords, IEmai
 
         // Verify the magic bytes so a renamed executable cannot be stored as an image.
         await using var stream = file.OpenReadStream();
-        var header = new byte[4];
+        var header = new byte[12];
         var read = await stream.ReadAsync(header);
-        if (read < 3 || !kind.Signatures.Any(sig => header.Take(sig.Length).SequenceEqual(sig)))
+        if (!kind.Signatures.Any(sig => read >= sig.Length && header.Take(sig.Length).SequenceEqual(sig)) ||
+            (extension.Equals(".webp", StringComparison.OrdinalIgnoreCase) &&
+             (read < 12 || !header.Skip(8).Take(4).SequenceEqual(new byte[] { 0x57, 0x45, 0x42, 0x50 }))))
             return Problem("That file does not look like a valid image.", statusCode: 400);
         stream.Position = 0;
 
@@ -112,7 +138,8 @@ public class AdminController(ShopDbContext db, IPasswordService passwords, IEmai
             UploadedByUserId = CurrentUserId()
         };
         db.ProductImages.Add(image);
-        Audit("ProductImageUploaded", $"Uploaded image {image.FileName} ({image.Length} bytes)");
+        var offerUpload = Request.Path.Value?.EndsWith("/offer-image", StringComparison.Ordinal) == true;
+        Audit(offerUpload ? "OfferImageUploaded" : "ProductImageUploaded", $"Uploaded image {image.FileName} ({image.Length} bytes)");
         await db.SaveChangesAsync();
 
         // Relative URL: the SPA proxies /api, so the image stays reachable regardless of host or port.
@@ -335,6 +362,7 @@ public class AdminController(ShopDbContext db, IPasswordService passwords, IEmai
 
         var actor = User.FindFirstValue(ClaimTypes.Email) ?? "admin";
         db.AuditActivities.Add(new AuditActivity { UserId = id, Action = "AdminPasswordReset", Details = $"Password reset for {user.Email} by {actor}" });
+        await sessions.RevokeAllForUserAsync(user.Id);
         await db.SaveChangesAsync();
         return Ok(new { message = $"Password updated for {user.Email}." });
     }

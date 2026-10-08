@@ -18,6 +18,10 @@ public class RazorpayOptions
 }
 
 public record RazorpayOrder(string Id, long AmountMinor, string Currency);
+public class RazorpayApiException(string message, int statusCode) : Exception(message)
+{
+    public int StatusCode { get; } = statusCode;
+}
 
 /// <summary>
 /// Outcome of verifying a Razorpay callback. <see cref="Captured"/> distinguishes a payment that
@@ -41,7 +45,7 @@ public interface IRazorpayGateway
     bool Enabled { get; }
     string KeyId { get; }
     Task<RazorpayOrder> CreateOrderAsync(decimal amount, string receipt, IDictionary<string, string>? notes, CancellationToken ct = default);
-    Task<RazorpayVerification> VerifyAsync(string razorpayOrderId, string razorpayPaymentId, string signature, decimal expectedAmount, CancellationToken ct = default);
+    Task<RazorpayVerification> VerifyAsync(string razorpayOrderId, string razorpayPaymentId, string signature, decimal? expectedAmount, int userId, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -63,7 +67,7 @@ public class RazorpayGateway(HttpClient http, RazorpayOptions options, ILogger<R
     public async Task<RazorpayOrder> CreateOrderAsync(decimal amount, string receipt, IDictionary<string, string>? notes, CancellationToken ct = default)
     {
         if (!Enabled) throw new InvalidOperationException("Razorpay is not configured.");
-        if (amount <= 0) throw new InvalidOperationException("Amount must be greater than zero.");
+        if (amount < 1m) throw new InvalidOperationException("Minimum payment amount is 100 paise (INR 1).");
 
         var payload = new Dictionary<string, object>
         {
@@ -86,7 +90,8 @@ public class RazorpayGateway(HttpClient http, RazorpayOptions options, ILogger<R
         if (!response.IsSuccessStatusCode)
         {
             logger.LogError("Razorpay order creation failed ({Status}): {Body}", (int)response.StatusCode, body);
-            throw new InvalidOperationException($"Could not start the payment: {DescribeError(body)}");
+            throw new RazorpayApiException("Could not start the payment. Please contact support or try again.",
+                response.StatusCode == System.Net.HttpStatusCode.Unauthorized ? 401 : 500);
         }
 
         using var doc = JsonDocument.Parse(body);
@@ -97,7 +102,7 @@ public class RazorpayGateway(HttpClient http, RazorpayOptions options, ILogger<R
             root.TryGetProperty("currency", out var c) ? c.GetString() ?? options.Currency : options.Currency);
     }
 
-    public async Task<RazorpayVerification> VerifyAsync(string razorpayOrderId, string razorpayPaymentId, string signature, decimal expectedAmount, CancellationToken ct = default)
+    public async Task<RazorpayVerification> VerifyAsync(string razorpayOrderId, string razorpayPaymentId, string signature, decimal? expectedAmount, int userId, CancellationToken ct = default)
     {
         if (!Enabled) return Failed("Razorpay is not configured.");
         if (string.IsNullOrWhiteSpace(razorpayOrderId) || string.IsNullOrWhiteSpace(razorpayPaymentId) || string.IsNullOrWhiteSpace(signature))
@@ -107,8 +112,27 @@ public class RazorpayGateway(HttpClient http, RazorpayOptions options, ILogger<R
         if (!SignatureIsValid(razorpayOrderId, razorpayPaymentId, signature))
         {
             logger.LogWarning("Rejected Razorpay callback with an invalid signature for order {OrderId}.", razorpayOrderId);
-            return Failed("We could not verify this payment. If money was deducted it will be refunded automatically.");
+            return Failed("Invalid payment signature. No order was created. If money was deducted, contact support.");
         }
+
+        // Retrieve the server-created order; never accept a different shopper's order or amount.
+        using var orderRequest = new HttpRequestMessage(HttpMethod.Get, $"https://api.razorpay.com/v1/orders/{Uri.EscapeDataString(razorpayOrderId)}");
+        orderRequest.Headers.Authorization = BasicAuth();
+        using var orderResponse = await http.SendAsync(orderRequest, ct);
+        if (!orderResponse.IsSuccessStatusCode)
+            throw new RazorpayApiException("Could not retrieve the payment order. Please contact support.",
+                orderResponse.StatusCode == System.Net.HttpStatusCode.Unauthorized ? 401 : 500);
+        using var orderDoc = JsonDocument.Parse(await orderResponse.Content.ReadAsStringAsync(ct));
+        var orderRoot = orderDoc.RootElement;
+        if (!orderRoot.TryGetProperty("notes", out var notes) || notes.ValueKind != JsonValueKind.Object ||
+            !notes.TryGetProperty("userId", out var owner) || owner.ValueKind != JsonValueKind.String ||
+            owner.GetString() != userId.ToString(CultureInfo.InvariantCulture))
+            return Failed("This payment order does not belong to your account.");
+        var orderAmount = orderRoot.GetProperty("amount").GetInt64();
+        var orderCurrency = orderRoot.GetProperty("currency").GetString();
+        if (orderAmount < 100 || orderCurrency != options.Currency ||
+            (expectedAmount is { } total && orderAmount != ToMinorUnits(total)))
+            return Failed("The payment order amount or currency does not match the checkout.");
 
         // 2. Ask Razorpay directly what happened. The browser is never trusted for status or amount.
         using var request = new HttpRequestMessage(HttpMethod.Get, $"https://api.razorpay.com/v1/payments/{Uri.EscapeDataString(razorpayPaymentId)}");
@@ -118,7 +142,8 @@ public class RazorpayGateway(HttpClient http, RazorpayOptions options, ILogger<R
         if (!response.IsSuccessStatusCode)
         {
             logger.LogError("Razorpay payment fetch failed ({Status}): {Body}", (int)response.StatusCode, body);
-            return Failed("We could not confirm this payment with the payment provider. Please contact support before retrying.");
+            throw new RazorpayApiException("We could not confirm this payment with the payment provider. Please contact support before retrying.",
+                response.StatusCode == System.Net.HttpStatusCode.Unauthorized ? 401 : 500);
         }
 
         using var doc = JsonDocument.Parse(body);
@@ -136,8 +161,8 @@ public class RazorpayGateway(HttpClient http, RazorpayOptions options, ILogger<R
         }
 
         // 4. The amount must match what we asked for, to the paisa.
-        var expectedMinor = ToMinorUnits(expectedAmount);
-        if (amountMinor != expectedMinor)
+        var expectedMinor = orderAmount;
+        if (amountMinor != expectedMinor || currency != orderCurrency)
         {
             logger.LogWarning("Razorpay amount mismatch on {PaymentId}: paid {Paid}, expected {Expected}.", razorpayPaymentId, amountMinor, expectedMinor);
             return Failed("The amount paid did not match the order total. No order was created.");
