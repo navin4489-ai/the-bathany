@@ -15,7 +15,7 @@ public record VerifyPaymentRequest(
     [property: JsonPropertyName("razorpay_signature")] string? Signature = null);
 
 [ApiController, Route("api/payments")]
-public class PaymentsController(IPaymentGateway gateway, IRazorpayGateway razorpay, ShopDbContext db, ILogger<PaymentsController> logger) : ControllerBase
+public class PaymentsController(IPaymentGateway gateway, IRazorpayGateway razorpay, ShopDbContext db, ILogger<PaymentsController> logger, IWebHostEnvironment environment) : ControllerBase
 {
     private int? CurrentUserId() => int.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out var id) ? id : null;
 
@@ -30,18 +30,20 @@ public class PaymentsController(IPaymentGateway gateway, IRazorpayGateway razorp
         var methods = new List<PaymentMethodInfo>();
         if (allowed && razorpay.Enabled)
             methods.Add(new(CheckoutService.RazorpayMethod, "Pay Online (Razorpay)", "UPI, cards, netbanking and wallets.", false));
-        else if (allowed)
+        else if (allowed && environment.IsDevelopment())
             methods.AddRange(gateway.Methods);
 
         return Ok(new
         {
             provider = razorpay.Enabled ? "Razorpay" : "The Bathany Secure Pay",
-            sandbox = true,
+            sandbox = razorpay.Enabled ? razorpay.IsTestMode : environment.IsDevelopment(),
             razorpayEnabled = allowed && razorpay.Enabled,
             razorpayKeyId = allowed && razorpay.Enabled ? razorpay.KeyId : "",
-            unavailableMessage = allowed ? "" : "Payments are temporarily disabled. Please try again later.",
+            unavailableMessage = !allowed ? "Payments are temporarily disabled. Please try again later."
+                : methods.Count == 0 ? "Online payment is temporarily unavailable. Please contact support." : "",
             methods,
-            testCards = !allowed || razorpay.Enabled ? Array.Empty<object>() : gateway.TestCards.Cast<object>().ToArray()
+            testCards = !allowed || razorpay.Enabled || !environment.IsDevelopment()
+                ? Array.Empty<object>() : gateway.TestCards.Cast<object>().ToArray()
         });
     }
 

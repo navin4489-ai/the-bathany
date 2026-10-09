@@ -128,7 +128,7 @@ public class DummyPaymentGateway : IPaymentGateway
     }
 }
 public interface ICheckoutService { Task<(Order? Order, string? Error)> Checkout(int userId, CheckoutRequest request); }
-public class CheckoutService(ShopDbContext db, IPaymentGateway gateway, IRazorpayGateway razorpay, IEmailService email) : ICheckoutService
+public class CheckoutService(ShopDbContext db, IPaymentGateway gateway, IRazorpayGateway razorpay, IEmailService email, IWebHostEnvironment environment) : ICheckoutService
 {
     public const string RazorpayMethod = "razorpay";
 
@@ -152,7 +152,8 @@ public class CheckoutService(ShopDbContext db, IPaymentGateway gateway, IRazorpa
         if (isRazorpay && !razorpay.Enabled) return (null, "Online payment is temporarily unavailable. Please choose another method.");
         // Once Razorpay is live it is the only accepted method; the simulated gateway is a
         // development fallback and must not be reachable by crafting a request.
-        if (!isRazorpay && razorpay.Enabled) return (null, "Please pay online to complete your order.");
+        if (!isRazorpay && (razorpay.Enabled || !environment.IsDevelopment()))
+            return (null, "Please pay online to complete your order.");
 
         // The total is always recomputed here from current database prices, so the amount verified
         // against the gateway is our figure and never one supplied by the browser.

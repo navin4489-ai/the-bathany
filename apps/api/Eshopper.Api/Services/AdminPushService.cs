@@ -200,12 +200,16 @@ public sealed class AdminPushService(
             await db.SaveChangesAsync(ct);
             return;
         }
+        var actions = await db.AuditActivities.AsNoTracking()
+            .Where(a => a.Id > row.LastActivityId && a.Id <= row.PendingThroughId)
+            .OrderBy(a => a.Id).Select(a => a.Action).Take(BatchSize).ToListAsync(ct);
         var payload = JsonSerializer.Serialize(new
         {
             notification = new
             {
-                title = "Store activity",
-                body = $"{row.PendingCount} new store activities. Open the admin dashboard to review.",
+                title = $"The Bathany - {row.PendingCount} new {(row.PendingCount == 1 ? "activity" : "activities")}",
+                body = AdminActivityNotification.Body(actions),
+                icon = "/icons/icon-192x192.png",
                 tag = $"admin-activity-{row.PendingThroughId}",
                 data = new
                 {
@@ -224,7 +228,7 @@ public sealed class AdminPushService(
             row.PendingThroughId = null;
             row.PendingCount = 0;
             row.FailureCount = 0;
-            row.NextAttemptAt = DateTime.UtcNow.AddSeconds(30);
+            row.NextAttemptAt = DateTime.UtcNow.AddSeconds(10);
             logger.LogInformation("Admin push accepted for subscription {Id}; cursor {Cursor}", id, row.LastActivityId);
         }
         catch (PushServiceClientException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Gone)

@@ -3,6 +3,7 @@ import { CommonModule } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
 import { RouterLink } from '@angular/router';
 import { Subscription } from 'rxjs';
+import { ActivityTracker } from './activity';
 
 export interface Offer {
   id: number;
@@ -21,14 +22,14 @@ export interface Offer {
     <section class="offer-banners" *ngIf="visible.length" aria-label="Current offers">
       <h2>Current offers</h2>
       <article class="offer-banner" *ngFor="let offer of visible">
-        <a routerLink="/shop" [attr.aria-label]="'Shop ' + offer.title">
+        <a routerLink="/shop" (click)="activity.record('OfferClick')" [attr.aria-label]="'Shop ' + offer.title">
           <img [src]="apiOrigin + offer.imageUrl" [alt]="offer.title" loading="lazy">
         </a>
         <div>
           <h3>{{ offer.title }}</h3>
           <p *ngIf="offer.description">{{ offer.description }}</p>
           <p class="muted">Valid until {{ offer.endsAt | date:'medium' }}</p>
-          <a class="btn-primary" routerLink="/shop">Shop now</a>
+          <a class="btn-primary" routerLink="/shop" (click)="activity.record('OfferClick')">Shop now</a>
         </div>
       </article>
     </section>
@@ -42,7 +43,7 @@ export class OfferBanners implements OnInit, OnDestroy {
   private expiry?: ReturnType<typeof setTimeout>;
   private request?: Subscription;
   private onFocus = () => this.load();
-  constructor(private http: HttpClient) {}
+  constructor(private http: HttpClient, public activity: ActivityTracker) {}
   get visible() {
     const now = Date.now();
     return this.offers.filter(o => o.enabled && Date.parse(o.startsAt) <= now && Date.parse(o.endsAt) > now);

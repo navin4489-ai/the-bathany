@@ -43,6 +43,7 @@ public record RazorpayVerification(
 public interface IRazorpayGateway
 {
     bool Enabled { get; }
+    bool IsTestMode { get; }
     string KeyId { get; }
     Task<RazorpayOrder> CreateOrderAsync(decimal amount, string receipt, IDictionary<string, string>? notes, CancellationToken ct = default);
     Task<RazorpayVerification> VerifyAsync(string razorpayOrderId, string razorpayPaymentId, string signature, decimal? expectedAmount, int userId, CancellationToken ct = default);
@@ -56,6 +57,7 @@ public interface IRazorpayGateway
 public class RazorpayGateway(HttpClient http, RazorpayOptions options, ILogger<RazorpayGateway> logger) : IRazorpayGateway
 {
     public bool Enabled => options.Enabled && !string.IsNullOrWhiteSpace(options.KeyId) && !string.IsNullOrWhiteSpace(options.KeySecret);
+    public bool IsTestMode => options.KeyId.StartsWith("rzp_test_", StringComparison.Ordinal);
     public string KeyId => options.KeyId;
 
     private AuthenticationHeaderValue BasicAuth() =>

@@ -35,6 +35,10 @@ export class AdminPush {
       return;
     }
     this.available.set(false);
+    if (typeof Notification !== 'undefined' && Notification.permission === 'denied') {
+      this.message.set('Notifications are blocked on this device. Allow notifications for bathany.com in your browser or phone settings, then refresh. On iPhone, use the installed Home Screen app.');
+      return;
+    }
     if (!this.swPush.isEnabled || !globalThis.isSecureContext) {
       this.message.set('Push requires HTTPS and the installed production PWA service worker. On iPhone/iPad, add this app to your Home Screen first.');
       return;
@@ -137,6 +141,9 @@ export class AdminPush {
   selector: 'app-admin-push',
   standalone: true,
   template: `<section aria-label="Admin push notifications">
+    <h2>Mobile push notifications - admins only</h2>
+    <p>Get store activity alerts even when this app is closed: page visits, product views, searches, accounts, cart, wishlist, checkout and orders. Nearby events are grouped into one notification.</p>
+    <p>Install The Bathany on your phone, sign in as an admin, tap Enable notifications and choose Allow. On iPhone/iPad, use iOS 16.4+ and the Home Screen app. Only subscribed admin devices receive alerts.</p>
     <p role="status">{{ push.message() }}</p>
     <button type="button" class="btn-light btn-sm" [disabled]="push.busy()" (click)="push.status()">Refresh notifications</button>
     <button type="button" class="btn-light btn-sm" [disabled]="push.busy() || !push.available()" (click)="push.enable()">

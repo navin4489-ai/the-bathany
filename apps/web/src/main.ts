@@ -1,18 +1,19 @@
 import { bootstrapApplication } from '@angular/platform-browser';
 import { provideHttpClient, withInterceptors } from '@angular/common/http';
-import { ActivatedRoute, provideRouter, Router, RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
+import { ActivatedRoute, NavigationEnd, provideRouter, Router, RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
 import { Component, Injectable, LOCALE_ID, DEFAULT_CURRENCY_CODE, OnDestroy, NgZone, isDevMode, Input, Output, EventEmitter, inject, provideAppInitializer, ErrorHandler } from '@angular/core';
 import { CommonModule, CurrencyPipe, DatePipe, UpperCasePipe, registerLocaleData } from '@angular/common';
 import localeIn from '@angular/common/locales/en-IN';
 import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
-import { Observable, of } from 'rxjs';
+import { Observable, of, switchMap } from 'rxjs';
 import { catchError } from 'rxjs/operators';
 import { timeout } from 'rxjs/operators';
 import { provideServiceWorker } from '@angular/service-worker';
 import { Offer, OfferBanners } from './offer-banners';
 import { AppSessionClient, appSessionInterceptor, APP_SESSION_API_ORIGIN } from './app-session';
 import { AdminPush, AdminPushControls } from './admin-push';
+import { ActivityTracker, ShopperActivity } from './activity';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 
 registerLocaleData(localeIn);
@@ -44,6 +45,7 @@ export function imageSrc(url: string | null | undefined): string {
 @Injectable({ providedIn: 'root' })
 export class Api {
   private sessions = inject(AppSessionClient);
+  private activity = inject(ActivityTracker);
   private readonly base = `${API_ORIGIN}/api`;
   constructor(private http: HttpClient) {}
   products(query = ''): Observable<Product[]> {
@@ -91,8 +93,8 @@ export class Api {
   login(body: unknown) { return this.http.post<{ accessToken: string }>(`${this.base}/auth/login`, body); }
   logout() { return this.sessions.logout(); }
   /** Fire-and-forget: tracking must never block or break the shopper's action. */
-  track(action: string, productId: number, quantity?: number) {
-    this.http.post(`${this.base}/activity`, { action, productId, quantity }, { headers: this.authHeaders() }).pipe(catchError(() => of(null))).subscribe();
+  track(action: ShopperActivity, productId?: number, quantity?: number) {
+    this.activity.record(action, productId, quantity);
   }
   register(body: unknown) { return this.http.post<{ id: number; email: string }>(`${this.base}/auth/register`, body); }
   forgotPassword(body: unknown) { return this.http.post<any>(`${this.base}/auth/forgot-password`, body); }
@@ -438,7 +440,7 @@ export class InstallGuide {
         <img class="brand-logo" src="assets/brand/logo.jpeg" alt="The Bathany">
         <span class="brand-text"><span class="brand-name">The Bathany</span><span class="brand-tagline">Botanical Bath Rituals</span></span>
       </a>
-      <div class="search"><input placeholder="Search whipped soaps, potions, bath clouds…"><button aria-label="Search">⌕</button></div>
+      <div class="search"><input #headerSearch (keyup.enter)="searchCollection(headerSearch.value)" placeholder="Search whipped soaps, potions, bath clouds…"><button aria-label="Search" (click)="searchCollection(headerSearch.value)">⌕</button></div>
       <div class="header-actions">
         <a class="wishlist" routerLink="/wishlist">♡ Wishlist ({{ wishlist.items.length }})</a>
         <a routerLink="/cart">🛒 Cart ({{ cart.lines.length }})</a>
@@ -485,7 +487,7 @@ export class InstallGuide {
           </a>
         </div>
       </div>
-      <div class="footer-note"><span class="footer-links"><a routerLink="/rituals">Our Rituals</a><a routerLink="/ingredients">Ingredients</a><a routerLink="/care">Care</a><a routerLink="/about">About Us</a><a routerLink="/contact">Contact Us</a></span><span>All natural · Cruelty free · Sulfate free · Paraben free</span><span>© {{ year }} The Bathany. Secure test checkout.</span></div>
+      <div class="footer-note"><span class="footer-links"><a routerLink="/rituals">Our Rituals</a><a routerLink="/ingredients">Ingredients</a><a routerLink="/care">Care</a><a routerLink="/about">About Us</a><a routerLink="/contact">Contact Us</a></span><span>All natural · Cruelty free · Sulfate free · Paraben free</span><span>© {{ year }} The Bathany. Secure checkout.</span></div>
     </footer>
   `
 })
@@ -496,7 +498,15 @@ export class App {
   logoutError = '';
   sessions = inject(AppSessionClient);
   private adminPush = inject(AdminPush);
-  constructor(public cart: CartStore, public toast: Toast, public auth: Auth, public wishlist: WishlistStore, public installService: AppInstall, private router: Router, private api: Api) {}
+  constructor(public cart: CartStore, public toast: Toast, public auth: Auth, public wishlist: WishlistStore, public installService: AppInstall, private router: Router, private api: Api, activity: ActivityTracker) {
+    this.router.events.pipe(takeUntilDestroyed()).subscribe(event => {
+      if (event instanceof NavigationEnd) {
+        const path = event.urlAfterRedirects.split(/[?#]/)[0];
+        if (/^\/detail\/\d+$/.test(path)) activity.record('ProductView', Number(path.split('/')[2]));
+        else activity.record('PageView', undefined, undefined, path);
+      }
+    });
+  }
   async logout(event?: Event) {
     event?.preventDefault();
     if (this.signingOut) return;
@@ -518,6 +528,9 @@ export class App {
         this.router.navigateByUrl('/');
       }
     });
+  }
+  searchCollection(query: string) {
+    this.router.navigate(['/shop'], { queryParams: { search: query.trim() } });
   }
 }
 
@@ -548,7 +561,7 @@ export class App {
       </section>
       <app-offer-banners [apiOrigin]="apiOrigin"></app-offer-banners>
       <div class="section-heading" id="collection"><h2>The collection</h2><span class="muted">Four rituals, endlessly whimsical</span></div>
-      <div class="toolbar"><input [(ngModel)]="query" (ngModelChange)="load()" placeholder="Search the collection"></div>
+      <div class="toolbar"><input [(ngModel)]="query" (ngModelChange)="search()" placeholder="Search the collection"></div>
       <section class="grid"><article class="product-card" *ngFor="let p of products"><a [routerLink]="['/detail', p.id]"><img [src]="img(p.imageUrl)" [alt]="p.name"></a><button class="wish-btn" [class.on]="wishlist.has(p.id)" (click)="wishlist.toggle(p)" [attr.aria-pressed]="wishlist.has(p.id)" [attr.aria-label]="(wishlist.has(p.id) ? 'Remove ' + p.name + ' from wishlist' : 'Save ' + p.name + ' to wishlist')">{{ wishlist.has(p.id) ? '♥' : '♡' }}</button><div class="product-info"><h3><a [routerLink]="['/detail', p.id]">{{ p.name }}</a></h3><p>{{ p.description }}</p><span class="price">{{ p.price | currency }}</span><button class="btn-primary" (click)="cart.add(p)">Add to cart</button></div></article></section>
     </div>
   `
@@ -559,8 +572,20 @@ export class Shop implements OnDestroy {
   slides = ['assets/brand/product-4.jpeg', 'assets/brand/product-1.jpeg', 'assets/brand/product-3.jpeg', 'assets/brand/product-2.jpeg'];
   activeSlide = 0;
   private timer?: ReturnType<typeof setInterval>;
-  constructor(private api: Api, public cart: CartStore, public wishlist: WishlistStore) { this.load(); this.startCarousel(); }
+  private searchTimer?: ReturnType<typeof setTimeout>;
+  constructor(private api: Api, public cart: CartStore, public wishlist: WishlistStore, route: ActivatedRoute) {
+    route.queryParamMap.pipe(takeUntilDestroyed()).subscribe(params => {
+      this.query = params.get('search') || '';
+      this.search();
+    });
+    this.startCarousel();
+  }
   load() { this.api.products(this.query).subscribe(products => this.products = products); }
+  search() {
+    this.load();
+    clearTimeout(this.searchTimer);
+    if (this.query.trim()) this.searchTimer = setTimeout(() => this.api.track('Search'), 600);
+  }
   img = imageSrc;
   scrollToCollection() { document.getElementById('collection')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
   private startCarousel() { this.timer = setInterval(() => this.activeSlide = (this.activeSlide + 1) % this.slides.length, 4000); }
@@ -569,7 +594,7 @@ export class Shop implements OnDestroy {
     if (this.timer) clearInterval(this.timer);
     this.startCarousel();
   }
-  ngOnDestroy() { if (this.timer) clearInterval(this.timer); }
+  ngOnDestroy() { if (this.timer) clearInterval(this.timer); clearTimeout(this.searchTimer); }
 }
 
 @Component({
@@ -580,8 +605,10 @@ export class Detail {
   product!: Product;
   img = imageSrc;
   constructor(private api: Api, private route: ActivatedRoute, public cart: CartStore, public wishlist: WishlistStore) {
-    const id = Number(this.route.snapshot.paramMap.get('id')) || 1;
-    this.api.product(id).subscribe(product => this.product = product);
+    this.route.paramMap.pipe(
+      switchMap(params => this.api.product(Number(params.get('id')) || 1)),
+      takeUntilDestroyed()
+    ).subscribe(product => this.product = product);
   }
 }
 
@@ -590,7 +617,7 @@ export class Detail {
   template: `
     <div class="page"><div class="section-heading"><h1>Shopping cart</h1><a routerLink="/" class="muted">Continue shopping →</a></div>
       <p *ngIf="!cart.lines.length" class="muted">Your cart is empty. Add something you love.</p>
-      <div *ngFor="let line of cart.lines; let i=index" class="cart-row"><strong>{{ line.product.name }}</strong><input type="number" min="1" [(ngModel)]="line.quantity" (ngModelChange)="cart.save()"><span>{{ line.product.price * line.quantity | currency }}</span><button class="btn-light" (click)="cart.remove(i)">Remove</button></div>
+      <div *ngFor="let line of cart.lines; let i=index" class="cart-row"><strong>{{ line.product.name }}</strong><input type="number" min="1" [(ngModel)]="line.quantity" (ngModelChange)="cart.save()" (change)="trackQuantity(line)"><span>{{ line.product.price * line.quantity | currency }}</span><button class="btn-light" (click)="cart.remove(i)">Remove</button></div>
       <div class="summary"><div class="summary-line"><span>Subtotal</span><strong>{{ cart.total() | currency }}</strong></div><div class="summary-line"><span>Shipping</span><span>Free</span></div><hr><div class="summary-line"><strong>Total</strong><strong class="price">{{ cart.total() | currency }}</strong></div>
         <div class="ship-panel">
           <div class="pay-brand"><span class="ship-badge">Delivery</span><strong>Shipping address</strong></div>
@@ -647,7 +674,7 @@ export class Detail {
           </div>
         </div>
         <div class="pay-panel">
-          <div class="pay-brand"><span class="pay-badge">{{ !methods.length ? 'Unavailable' : razorpayEnabled ? 'Secure' : 'Sandbox' }}</span><strong>{{ !methods.length ? 'Payments unavailable' : razorpayEnabled ? 'Razorpay Secure Checkout' : 'The Bathany Secure Pay' }}</strong></div>
+          <div class="pay-brand"><span class="pay-badge">{{ !methods.length ? 'Unavailable' : razorpayEnabled ? (sandbox ? 'Test mode' : 'Secure') : 'Sandbox' }}</span><strong>{{ !methods.length ? 'Payments unavailable' : razorpayEnabled ? 'Razorpay Secure Checkout' : 'The Bathany Secure Pay' }}</strong></div>
           <p class="muted pay-note" *ngIf="methods.length && !razorpayEnabled">No real money moves. Use a test card below to simulate results.</p>
 
           <div class="pay-methods" *ngIf="methods.length > 1">
@@ -658,7 +685,7 @@ export class Detail {
 
           <div *ngIf="isRazorpay()" class="pay-online">
             <p class="muted pay-note">You'll be taken to Razorpay's secure window to pay by UPI, card, netbanking or wallet.</p>
-            <details class="pay-testcards">
+            <details class="pay-testcards" *ngIf="sandbox">
               <summary>Test payment details</summary>
               <p class="muted">Razorpay test mode — no real money moves. Use UPI id <strong>success&#64;razorpay</strong>, or card <strong>4111 1111 1111 1111</strong> with any future expiry and any CVV.</p>
             </details>
@@ -734,6 +761,7 @@ export class Cart implements OnDestroy {
   paymentUnavailable = 'Payment options are unavailable. Please refresh and try again.';
   testCards: any[] = [];
   razorpayEnabled = false;
+  sandbox = false;
   private razorpayKeyId = '';
   private static sdk: Promise<boolean> | null = null;
   constructor(public cart: CartStore, private api: Api, private auth: Auth, private router: Router, private zone: NgZone) {
@@ -743,6 +771,7 @@ export class Cart implements OnDestroy {
       this.paymentUnavailable = res?.unavailableMessage || 'Payment options are unavailable. Please refresh and try again.';
       this.testCards = res?.testCards || [];
       this.razorpayEnabled = !!res?.razorpayEnabled;
+      this.sandbox = res?.sandbox === true;
       this.razorpayKeyId = res?.razorpayKeyId || '';
       // Default to online payment when it is available, since that is the real gateway.
       this.method = this.methods.find(m => m.code === 'razorpay')?.code || this.methods[0]?.code || '';
@@ -912,6 +941,7 @@ export class Cart implements OnDestroy {
     if (this.showAddressForm && !this.savedAddresses.length) {
       this.api.createAddress({ ...this.address, isDefault: true }).subscribe({ next: () => this.loadAddresses(), error: () => { /* checkout continues regardless */ } });
     }
+    this.api.track('CheckoutStarted');
     if (this.isRazorpay()) { this.payWithRazorpay(); return; }
     this.placeOrder({});
   }
@@ -962,12 +992,13 @@ export class Cart implements OnDestroy {
             });
           }),
           modal: {
-            ondismiss: () => this.zone.run(() => { if (finalizing || this.confirmed) return; this.placing = false; this.message = 'Payment was cancelled. Your cart is unchanged.'; })
+            ondismiss: () => this.zone.run(() => { if (finalizing || this.confirmed) return; this.api.track('PaymentCancelled'); this.placing = false; this.message = 'Payment was cancelled. Your cart is unchanged.'; })
           }
         };
         try {
           const rzp = new (window as any).Razorpay(options);
           rzp.on('payment.failed', (event: any) => this.zone.run(() => {
+            this.api.track('PaymentFailed');
             this.placing = false;
             this.message = event?.error?.description || 'The payment failed. Please try another method.';
           }));
@@ -983,6 +1014,11 @@ export class Cart implements OnDestroy {
         this.message = error.error?.detail || 'Could not start the payment. Please try again.';
       }
     });
+  }
+
+  trackQuantity(line: Line) {
+    if (Number.isInteger(line.quantity) && line.quantity >= 1 && line.quantity <= 999)
+      this.api.track('CartQuantityChanged', line.product.id, line.quantity);
   }
 
   /** Sends the order to the server; `extra` carries the Razorpay confirmation when there is one. */
